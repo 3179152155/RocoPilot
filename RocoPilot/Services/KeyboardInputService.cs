@@ -24,7 +24,6 @@ public sealed class KeyboardInputService : IKeyboardInputService, IDisposable
     private const uint KeyEventFKeyUp = 0x0002;
     private const uint KeyEventFScanCode = 0x0008;
 
-    private readonly object _interceptionSyncRoot = new();
     private InterceptionKeyboardHook? _interceptionKeyboardHook;
 
     public bool IsWindowAvailable(IntPtr hwnd)
@@ -73,7 +72,7 @@ public sealed class KeyboardInputService : IKeyboardInputService, IDisposable
 
     public void Dispose()
     {
-        lock (_interceptionSyncRoot)
+        lock (InterceptionSynchronization.Gate)
         {
             _interceptionKeyboardHook?.Dispose();
             _interceptionKeyboardHook = null;
@@ -329,7 +328,7 @@ public sealed class KeyboardInputService : IKeyboardInputService, IDisposable
         }
 
         bool isSent;
-        lock (_interceptionSyncRoot)
+        lock (InterceptionSynchronization.Gate)
         {
             isSent = keyboardHook.SetKeyState(keyCode, keyState);
         }
@@ -342,7 +341,7 @@ public sealed class KeyboardInputService : IKeyboardInputService, IDisposable
 
     private InterceptionKeyboardHook GetInterceptionKeyboardHook()
     {
-        lock (_interceptionSyncRoot)
+        lock (InterceptionSynchronization.Gate)
         {
             if (_interceptionKeyboardHook?.CanSimulateInput == true)
             {

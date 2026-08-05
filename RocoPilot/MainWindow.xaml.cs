@@ -3,6 +3,7 @@ using Microsoft.UI.Xaml;
 
 using RocoPilot.Contracts.Services;
 using RocoPilot.Helpers;
+using RocoPilot.Services;
 
 using Serilog;
 
@@ -47,6 +48,14 @@ public sealed partial class MainWindow : WindowEx
     private async Task ShutdownAsync()
     {
         UnsubscribeThemeEvents();
+
+        try
+        {
+            await App.GetService<CameraSweepService>().StopAsync();
+        }
+        catch
+        {
+        }
 
         try
         {

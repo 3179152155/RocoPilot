@@ -24,7 +24,12 @@ public sealed record HotkeyActionDescriptor(
                 HotkeyAction.ToggleAutoBattle,
                 "自动战斗",
                 "切换战斗技能自动释放。",
-                "\uF272")
+                "\uF272"),
+            new(
+                HotkeyAction.ToggleCameraSweep,
+                "视角巡航",
+                "切换左右匀速转动视角。",
+                "\uE7F4")
         ];
     }
 }

@@ -76,7 +76,8 @@ public class HotkeyViewModel : ObservableRecipient
                 "\uE916",
                 items.Where(item => item.Action
                     is HotkeyAction.ToggleEncounterStatistics
-                    or HotkeyAction.ToggleAutoBattle).ToList())
+                    or HotkeyAction.ToggleAutoBattle
+                    or HotkeyAction.ToggleCameraSweep).ToList())
         ];
 
         _hotkeyService = hotkeyService;

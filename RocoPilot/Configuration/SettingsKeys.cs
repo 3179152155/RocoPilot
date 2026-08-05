@@ -16,5 +16,7 @@ internal static class SettingsKeys
 
     public const string HotkeySettings = "HotkeySettings";
 
+    public const string CameraSweepSettings = "CameraSweepSettings";
+
     public const string ImageMatchAlgorithm = "ImageMatchAlgorithm";
 }

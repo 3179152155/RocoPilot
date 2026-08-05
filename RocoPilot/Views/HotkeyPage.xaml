@@ -115,7 +115,7 @@
                         <TextBlock
                             FontSize="13"
                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                            Text="仅在实时任务运行且目标游戏窗口为焦点时触发。点击热键后重新设置，Esc 可清除。"
+                            Text="仅在目标游戏窗口为焦点时触发。点击热键后重新设置，Esc 可清除。"
                             TextWrapping="Wrap" />
                     </StackPanel>
                 </Grid>

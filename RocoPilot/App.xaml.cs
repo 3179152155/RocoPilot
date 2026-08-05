@@ -97,6 +97,7 @@ public partial class App : Application
             services.AddSingleton<IGameWindowService, GameWindowService>();
             services.AddSingleton<IKeyboardInputService, KeyboardInputService>();
             services.AddSingleton<IInterceptionDriverService, InterceptionDriverService>();
+            services.AddSingleton<CameraSweepService>();
             services.AddSingleton<RuntimeTaskService>();
             services.AddSingleton<StatisticsUidRuntimeTaskService>();
             services.AddSingleton<IRuntimeTaskService>(
@@ -157,6 +158,8 @@ public partial class App : Application
         }).
         Build();
 
+        // Keep the camera hotkey listener alive even before the realtime page is opened.
+        _ = App.GetService<CameraSweepService>();
         App.GetService<IAppNotificationService>().Initialize();
         _ = App.GetService<OnnxOcrV5SingleLineTextRecognitionBackend>().PrewarmAsync();
 
@@ -176,5 +179,7 @@ public partial class App : Application
         App.GetService<IAppNotificationService>().Show(string.Format("AppNotificationSamplePayload".GetLocalized(), AppContext.BaseDirectory));
 
         await App.GetService<IActivationService>().ActivateAsync(args);
+        await App.GetService<CameraSweepService>().LoadSettingsAsync();
+        await App.GetService<IHotkeyService>().LoadSettingsAsync();
     }
 }

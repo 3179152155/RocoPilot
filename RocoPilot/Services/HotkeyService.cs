@@ -346,19 +346,22 @@ public sealed class HotkeyService : IHotkeyService, IDisposable
         return HotkeyBinding.Create(modifiers, virtualKey);
     }
 
-    private static HotkeySettings NormalizeSettings(HotkeySettings? settings)
+    internal static HotkeySettings NormalizeSettings(HotkeySettings? settings)
     {
-        var normalized = HotkeySettings.CreateDefault();
-        if (settings?.Bindings is null)
+        if (settings is null)
         {
-            return normalized;
+            return HotkeySettings.CreateDefault();
         }
 
+        var normalized = new HotkeySettings
+        {
+            Version = HotkeySettings.CurrentVersion
+        };
         var validActions = HotkeyActionDescriptor.CreateDefault()
             .Select(descriptor => descriptor.Action)
             .ToHashSet();
         var usedGestureIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var assignment in settings.Bindings)
+        foreach (var assignment in settings.Bindings ?? [])
         {
             if (!validActions.Contains(assignment.Action))
             {
@@ -376,6 +379,21 @@ public sealed class HotkeyService : IHotkeyService, IDisposable
                 Action = assignment.Action,
                 Binding = binding
             });
+        }
+
+        if (settings.Version < HotkeySettings.CurrentVersion
+            && normalized.GetBinding(HotkeyAction.ToggleCameraSweep) is null)
+        {
+            var defaultBinding = HotkeySettings.CreateDefault()
+                .GetBinding(HotkeyAction.ToggleCameraSweep);
+            if (defaultBinding is not null && usedGestureIds.Add(defaultBinding.GestureId))
+            {
+                normalized.Bindings.Add(new HotkeyBindingAssignment
+                {
+                    Action = HotkeyAction.ToggleCameraSweep,
+                    Binding = defaultBinding
+                });
+            }
         }
 
         return normalized;
@@ -466,6 +484,7 @@ public sealed class HotkeyService : IHotkeyService, IDisposable
             HotkeyAction.ToggleInfoOverlay => "信息遮罩窗口",
             HotkeyAction.ToggleEncounterStatistics => "奇遇统计",
             HotkeyAction.ToggleAutoBattle => "自动战斗",
+            HotkeyAction.ToggleCameraSweep => "视角巡航",
             _ => action.ToString()
         };
     }
