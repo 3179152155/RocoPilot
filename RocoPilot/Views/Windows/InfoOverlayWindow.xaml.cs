@@ -1,12 +1,12 @@
 using System.Runtime.InteropServices;
 
 using Microsoft.UI.Dispatching;
-using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 
 using RocoPilot.Helpers;
 using RocoPilot.Models.Capture;
@@ -19,12 +19,11 @@ namespace RocoPilot.Views.Windows;
 
 public sealed partial class InfoOverlayWindow : WindowEx
 {
-    private const int OverlayWidth = 344;
-    private const int OverlayHeight = 316;
-    private const int MinOverlayWidth = 286;
-    private const int MinOverlayHeight = 252;
-    private const int DefaultMargin = 16;
-    private const int MaxVisibleCounters = 5;
+    private const int OverlayWidth = 400;
+    private const int OverlayHeight = 60;
+    private const int MinOverlayWidth = 280;
+    private const int MinOverlayHeight = 48;
+    private const int DefaultMargin = 12;
 
     private static readonly TimeSpan FollowInterval = TimeSpan.FromMilliseconds(250);
     private static readonly Color ActiveTaskIndicatorForeground = Color.FromArgb(0xFF, 0x34, 0xD3, 0x99);
@@ -32,10 +31,6 @@ public sealed partial class InfoOverlayWindow : WindowEx
     private static readonly Color DisabledIndicatorForeground = Color.FromArgb(0xFF, 0x8B, 0x95, 0xA1);
     private static readonly Color DisabledIndicatorBackground = Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF);
     private static readonly Color DisabledIndicatorBorder = Color.FromArgb(0x24, 0xFF, 0xFF, 0xFF);
-    private static readonly Color CounterPrimaryForeground = Color.FromArgb(0xFF, 0xF8, 0xFA, 0xFC);
-    private static readonly Color CounterSecondaryForeground = Color.FromArgb(0xFF, 0x93, 0x9D, 0xAA);
-    private static readonly Color CounterAccentForeground = Color.FromArgb(0xFF, 0x7D, 0xD3, 0xFC);
-    private static readonly Color CounterRowBorder = Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF);
 
     private readonly CaptureTargetWindow _targetWindow;
     private readonly DispatcherQueueTimer _followTimer;
@@ -50,6 +45,13 @@ public sealed partial class InfoOverlayWindow : WindowEx
     private int _overlayOffsetY;
     private int _lastMagicPointCount;
     private int _lastMagicPointMaximum = 6;
+    private DateTimeOffset? _lastCounterUpdate;
+    private Storyboard? _stateDotPulse;
+    private Storyboard? _statusTransition;
+    private Storyboard? _islandBulge;
+    private string? _lastStatusText;
+    private bool _isEncounterStatisticsEnabled;
+    private bool _isAutoBattleEnabled;
     private bool _hasActivated;
     private bool _hasUserPositioned;
     private bool _isLocked;
@@ -147,28 +149,34 @@ public sealed partial class InfoOverlayWindow : WindowEx
             _lastMagicPointCount = Math.Clamp(snapshot.MagicPointCount.Value, 0, magicPointMaximum);
         }
 
-        StatusText.Text = statusText;
-        StatusText.Foreground = new SolidColorBrush(ActiveTaskIndicatorForeground);
+        if (!string.Equals(_lastStatusText, statusText, StringComparison.Ordinal))
+        {
+            _lastStatusText = statusText;
+            StatusText.Text = statusText;
+            AnimateStatusIn();
+        }
+
         MagicPointText.Text = $"{_lastMagicPointCount}/{_lastMagicPointMaximum}";
         UpdatedAtText.Text = snapshot.UpdatedAt.ToLocalTime().ToString("HH:mm:ss");
 
-        var visibleCounters = snapshot.Counters
-            .OrderByDescending(counter => counter.LastCountedAt)
-            .Take(MaxVisibleCounters)
-            .ToList();
-
-        var latestCounter = visibleCounters.FirstOrDefault();
-        if (latestCounter is null)
+        DateTimeOffset? latestCounterUpdate = snapshot.Counters.Count == 0
+            ? null
+            : snapshot.Counters.Max(counter => counter.LastCountedAt);
+        if (_lastCounterUpdate.HasValue
+            && latestCounterUpdate.HasValue
+            && latestCounterUpdate.Value > _lastCounterUpdate.Value)
         {
-            RenderCounters([]);
-            return;
+            AnimateIslandBulge();
         }
 
-        RenderCounters(visibleCounters);
+        _lastCounterUpdate = latestCounterUpdate;
     }
 
     public void UpdateTaskIndicators(bool isEncounterStatisticsEnabled, bool isAutoBattleEnabled)
     {
+        _isEncounterStatisticsEnabled = isEncounterStatisticsEnabled;
+        _isAutoBattleEnabled = isAutoBattleEnabled;
+
         SetTaskIndicator(
             PollutionCounterIndicator,
             PollutionCounterIcon,
@@ -182,6 +190,12 @@ public sealed partial class InfoOverlayWindow : WindowEx
             isAutoBattleEnabled,
             ActiveTaskIndicatorForeground,
             ActiveTaskIndicatorBackground);
+
+        var isActive = _isEncounterStatisticsEnabled || _isAutoBattleEnabled;
+        StateDot.Fill = new SolidColorBrush(isActive
+            ? ActiveTaskIndicatorForeground
+            : DisabledIndicatorForeground);
+        SyncStateDotPulse(isActive);
     }
 
     private static void SetTaskIndicator(
@@ -310,8 +324,8 @@ public sealed partial class InfoOverlayWindow : WindowEx
 
     private static RectInt32 GetDefaultOverlayBounds(RectInt32 clientBounds, SizeInt32 overlaySize)
     {
-        var x = clientBounds.X + clientBounds.Width - overlaySize.Width - DefaultMargin;
-        var y = clientBounds.Y + (clientBounds.Height - overlaySize.Height) / 2;
+        var x = clientBounds.X + (clientBounds.Width - overlaySize.Width) / 2;
+        var y = clientBounds.Y + DefaultMargin;
         return ClampToClient(clientBounds, x, y, overlaySize.Width, overlaySize.Height);
     }
 
@@ -335,187 +349,111 @@ public sealed partial class InfoOverlayWindow : WindowEx
         _isOverlayVisible = false;
     }
 
-    private void RenderCounters(IReadOnlyList<InfoOverlayCounter> counters)
+    private void AnimateStatusIn()
     {
-        CounterList.Children.Clear();
+        _statusTransition?.Stop();
 
-        if (counters.Count == 0)
+        var translateAnimation = new DoubleAnimation
         {
-            CounterList.Children.Add(new TextBlock
-            {
-                Text = "暂无其他记录",
-                FontSize = 12,
-                Foreground = new SolidColorBrush(CounterSecondaryForeground)
-            });
+            From = 4,
+            To = 0,
+            Duration = new Duration(TimeSpan.FromMilliseconds(180)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+        };
+        Storyboard.SetTarget(translateAnimation, StatusShift);
+        Storyboard.SetTargetProperty(translateAnimation, nameof(TranslateTransform.Y));
+
+        var fadeAnimation = new DoubleAnimation
+        {
+            From = 0.25,
+            To = 1,
+            Duration = new Duration(TimeSpan.FromMilliseconds(180)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+        };
+        Storyboard.SetTarget(fadeAnimation, StatusText);
+        Storyboard.SetTargetProperty(fadeAnimation, nameof(UIElement.Opacity));
+
+        _statusTransition = new Storyboard();
+        _statusTransition.Children.Add(translateAnimation);
+        _statusTransition.Children.Add(fadeAnimation);
+        _statusTransition.Begin();
+    }
+
+    private void SyncStateDotPulse(bool isActive)
+    {
+        if (!isActive)
+        {
+            _stateDotPulse?.Stop();
+            _stateDotPulse = null;
+            StateDot.Opacity = 1;
             return;
         }
 
-        for (var index = 0; index < counters.Count; index++)
+        if (_stateDotPulse is not null)
         {
-            var rank = index + 1;
-            CounterList.Children.Add(rank == 1
-                ? CreateFeaturedCounterRow(counters[index])
-                : CreateCounterRow(counters[index], rank));
+            return;
         }
+
+        var pulseAnimation = new DoubleAnimation
+        {
+            From = 1,
+            To = 0.3,
+            Duration = new Duration(TimeSpan.FromMilliseconds(550)),
+            AutoReverse = true,
+            RepeatBehavior = RepeatBehavior.Forever,
+            EasingFunction = new SineEase { EasingMode = EasingMode.EaseInOut }
+        };
+        Storyboard.SetTarget(pulseAnimation, StateDot);
+        Storyboard.SetTargetProperty(pulseAnimation, nameof(UIElement.Opacity));
+
+        _stateDotPulse = new Storyboard();
+        _stateDotPulse.Children.Add(pulseAnimation);
+        _stateDotPulse.Begin();
     }
 
-    private static Border CreateFeaturedCounterRow(InfoOverlayCounter counter)
+    private void AnimateIslandBulge()
     {
-        var rowContent = new Grid
-        {
-            ColumnSpacing = 10,
-            MinHeight = 58
-        };
+        _islandBulge?.Stop();
 
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
-        {
-            Width = new GridLength(30)
-        });
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
-        {
-            Width = new GridLength(1, GridUnitType.Star)
-        });
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
-        {
-            Width = GridLength.Auto
-        });
+        var scaleXAnimation = CreateBulgeAnimation(1.035);
+        Storyboard.SetTarget(scaleXAnimation, IslandScale);
+        Storyboard.SetTargetProperty(scaleXAnimation, nameof(ScaleTransform.ScaleX));
 
-        var row = new Border
-        {
-            Padding = new Thickness(0, 7, 0, 8),
-            BorderBrush = new SolidColorBrush(CounterRowBorder),
-            BorderThickness = new Thickness(0, 0, 0, 1),
-            Child = rowContent
-        };
+        var scaleYAnimation = CreateBulgeAnimation(1.12);
+        Storyboard.SetTarget(scaleYAnimation, IslandScale);
+        Storyboard.SetTargetProperty(scaleYAnimation, nameof(ScaleTransform.ScaleY));
 
-        var rankText = new TextBlock
-        {
-            Text = "#1",
-            VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 12,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(CounterSecondaryForeground)
-        };
-
-        var nameStack = new StackPanel
-        {
-            VerticalAlignment = VerticalAlignment.Center,
-            Spacing = 2
-        };
-        nameStack.Children.Add(new TextBlock
-        {
-            Text = "最近捕捉精灵",
-            FontSize = 11,
-            Foreground = new SolidColorBrush(CounterSecondaryForeground)
-        });
-        nameStack.Children.Add(new TextBlock
-        {
-            Text = counter.CreatureName,
-            FontSize = 20,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(CounterPrimaryForeground),
-            MaxLines = 1,
-            TextTrimming = TextTrimming.CharacterEllipsis
-        });
-
-        var countText = new TextBlock
-        {
-            Text = counter.PollutionCount.ToString(),
-            MinWidth = 46,
-            HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Center,
-            FontSize = GetFeaturedCounterFontSize(counter.PollutionCount),
-            FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(CounterAccentForeground),
-            TextAlignment = TextAlignment.Right
-        };
-
-        Grid.SetColumn(rankText, 0);
-        Grid.SetColumn(nameStack, 1);
-        Grid.SetColumn(countText, 2);
-        rowContent.Children.Add(rankText);
-        rowContent.Children.Add(nameStack);
-        rowContent.Children.Add(countText);
-        return row;
+        _islandBulge = new Storyboard();
+        _islandBulge.Children.Add(scaleXAnimation);
+        _islandBulge.Children.Add(scaleYAnimation);
+        _islandBulge.Begin();
     }
 
-    private static Border CreateCounterRow(InfoOverlayCounter counter, int rank)
+    private static DoubleAnimationUsingKeyFrames CreateBulgeAnimation(double peak)
     {
-        var rowContent = new Grid
+        var animation = new DoubleAnimationUsingKeyFrames();
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame
         {
-            ColumnSpacing = 10,
-            MinHeight = 30
-        };
-
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
-        {
-            Width = new GridLength(30)
+            Value = 1,
+            KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero)
         });
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame
         {
-            Width = new GridLength(1, GridUnitType.Star)
+            Value = peak,
+            KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(90)),
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
         });
-        rowContent.ColumnDefinitions.Add(new ColumnDefinition
+        animation.KeyFrames.Add(new EasingDoubleKeyFrame
         {
-            Width = GridLength.Auto
+            Value = 1,
+            KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(330)),
+            EasingFunction = new BackEase
+            {
+                Amplitude = 0.4,
+                EasingMode = EasingMode.EaseOut
+            }
         });
-
-        var row = new Border
-        {
-            Padding = new Thickness(0, 5, 0, 6),
-            BorderBrush = new SolidColorBrush(CounterRowBorder),
-            BorderThickness = new Thickness(0, 0, 0, 1),
-            Child = rowContent
-        };
-
-        var rankText = new TextBlock
-        {
-            Text = $"#{rank}",
-            VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 12,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(CounterSecondaryForeground)
-        };
-
-        var name = new TextBlock
-        {
-            Text = counter.CreatureName,
-            FontSize = 13,
-            Foreground = new SolidColorBrush(CounterPrimaryForeground),
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-
-        var countText = new TextBlock
-        {
-            Text = counter.PollutionCount.ToString(),
-            MinWidth = 36,
-            HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 13,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(CounterAccentForeground),
-            TextAlignment = TextAlignment.Right
-        };
-
-        Grid.SetColumn(rankText, 0);
-        Grid.SetColumn(name, 1);
-        Grid.SetColumn(countText, 2);
-        rowContent.Children.Add(rankText);
-        rowContent.Children.Add(name);
-        rowContent.Children.Add(countText);
-        return row;
-    }
-
-    private static double GetFeaturedCounterFontSize(int count)
-    {
-        return count switch
-        {
-            >= 10000 => 20,
-            >= 1000 => 22,
-            >= 100 => 24,
-            _ => 28
-        };
+        return animation;
     }
 
     private void OverlayRoot_PointerPressed(object sender, PointerRoutedEventArgs e)
@@ -573,6 +511,9 @@ public sealed partial class InfoOverlayWindow : WindowEx
     {
         _isClosed = true;
         _followTimer.Stop();
+        _stateDotPulse?.Stop();
+        _statusTransition?.Stop();
+        _islandBulge?.Stop();
         _messageHook?.Dispose();
     }
 

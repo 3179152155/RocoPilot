@@ -18,7 +18,6 @@ public sealed partial class InfoOverlayWindow
     private const double TopNoticeSpacing = 8d;
 
     private bool _isTopNoticeLayoutInitialized;
-    private int _lastTopNoticeExtraPixelHeight;
     private StackPanel? _topNoticePanel;
     private Border? _uidNoticeAlert;
     private TextBlock? _uidNoticeTitleText;
@@ -49,7 +48,7 @@ public sealed partial class InfoOverlayWindow
         _uidNoticeAlert = CreateUidNoticeAlert();
         _topNoticePanel = new StackPanel
         {
-            Margin = new Thickness(0, 0, 0, TopNoticeSpacing),
+            Margin = new Thickness(8, TopNoticeSpacing, 8, 0),
             Spacing = TopNoticeSpacing,
             Visibility = Visibility.Collapsed
         };
@@ -59,9 +58,9 @@ public sealed partial class InfoOverlayWindow
         var layout = new Grid();
         layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        layout.Children.Add(_topNoticePanel);
-        Grid.SetRow(InfoPanel, 1);
         layout.Children.Add(InfoPanel);
+        Grid.SetRow(_topNoticePanel, 1);
+        layout.Children.Add(_topNoticePanel);
         OverlayRoot.Children.Add(layout);
 
         _followTimer.Tick -= FollowTimer_Tick;
@@ -170,7 +169,7 @@ public sealed partial class InfoOverlayWindow
             Background = CreateNoticeBrush(0xE6, 0x1D, 0x27, 0x33),
             BorderBrush = CreateNoticeBrush(0xCC, 0x60, 0xA5, 0xFA),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
+            CornerRadius = new CornerRadius(18),
             Visibility = Visibility.Collapsed,
             Child = content
         };
@@ -199,12 +198,6 @@ public sealed partial class InfoOverlayWindow
         _currentClientBounds = clientBounds;
         var baseOverlaySize = GetOverlayPixelSize(clientBounds);
         var topNoticeExtraHeight = GetTopNoticeExtraPixelHeight(clientBounds, baseOverlaySize.Height);
-        if (_hasUserPositioned && topNoticeExtraHeight != _lastTopNoticeExtraPixelHeight)
-        {
-            _overlayOffsetY -= topNoticeExtraHeight - _lastTopNoticeExtraPixelHeight;
-        }
-
-        _lastTopNoticeExtraPixelHeight = topNoticeExtraHeight;
         var overlaySize = new SizeInt32(
             baseOverlaySize.Width,
             baseOverlaySize.Height + topNoticeExtraHeight);
@@ -249,7 +242,7 @@ public sealed partial class InfoOverlayWindow
         return ClampToClient(
             clientBounds,
             baseBounds.X,
-            baseBounds.Y - topNoticeExtraHeight,
+            baseBounds.Y,
             baseBounds.Width,
             baseBounds.Height + topNoticeExtraHeight);
     }

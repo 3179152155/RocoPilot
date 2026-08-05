@@ -5,8 +5,8 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:windowex="using:WinUIEx"
-    Width="344"
-    Height="316"
+    Width="400"
+    Height="60"
     mc:Ignorable="d">
 
     <Grid
@@ -17,25 +17,29 @@
         PointerReleased="OverlayRoot_PointerReleased">
         <Border
             x:Name="InfoPanel"
-            Padding="14"
-            Background="#CC151719"
-            BorderBrush="#4AFFFFFF"
+            Height="52"
+            Margin="8,6,8,2"
+            Padding="14,0"
+            Background="#FF000000"
+            BorderBrush="#24FFFFFF"
             BorderThickness="1"
-            CornerRadius="8">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
+            CornerRadius="26"
+            RenderTransformOrigin="0.5,0.5">
+            <Border.RenderTransform>
+                <ScaleTransform
+                    x:Name="IslandScale"
+                    ScaleX="1"
+                    ScaleY="1" />
+            </Border.RenderTransform>
 
+            <Grid>
                 <Border
                     x:Name="PendingShinyAlert"
-                    Margin="0,0,0,10"
                     Padding="10,8"
-                    Background="#36F59E0B"
-                    BorderBrush="#9AF59E0B"
+                    Background="#E62B2416"
+                    BorderBrush="#CCF59E0B"
                     BorderThickness="1"
-                    CornerRadius="8"
+                    CornerRadius="18"
                     Visibility="Collapsed">
                     <Grid ColumnSpacing="9">
                         <Grid.ColumnDefinitions>
@@ -70,195 +74,118 @@
                 </Border>
 
                 <Grid
-                    Grid.Row="1"
-                    RowSpacing="10">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
+                    x:Name="CompactLayer"
+                    ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
 
-                    <Grid ColumnSpacing="10">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
+                    <Ellipse
+                        x:Name="StateDot"
+                        Width="8"
+                        Height="8"
+                        VerticalAlignment="Center"
+                        Fill="#34D399" />
 
-                        <StackPanel
+                    <TextBlock
+                        x:Name="StatusText"
+                        Grid.Column="1"
+                        VerticalAlignment="Center"
+                        FontSize="14"
+                        FontWeight="SemiBold"
+                        Foreground="#FFFFFFFF"
+                        MaxLines="1"
+                        Text="状态待识别"
+                        TextTrimming="CharacterEllipsis"
+                        TextWrapping="NoWrap">
+                        <TextBlock.RenderTransform>
+                            <TranslateTransform
+                                x:Name="StatusShift"
+                                Y="0" />
+                        </TextBlock.RenderTransform>
+                    </TextBlock>
+
+                    <Border
+                        x:Name="PollutionCounterIndicator"
+                        Grid.Column="2"
+                        Width="22"
+                        Height="22"
+                        Background="#2934D399"
+                        BorderBrush="#5534D399"
+                        BorderThickness="1"
+                        CornerRadius="11"
+                        ToolTipService.ToolTip="奇遇计数">
+                        <FontIcon
+                            x:Name="PollutionCounterIcon"
+                            HorizontalAlignment="Center"
                             VerticalAlignment="Center"
-                            Orientation="Horizontal"
-                            Spacing="8">
-                            <Border
-                                Width="8"
-                                Height="8"
-                                Background="#34D399"
-                                CornerRadius="4" />
-                            <TextBlock
-                                VerticalAlignment="Center"
-                                FontSize="12"
-                                FontWeight="SemiBold"
-                                Foreground="#E8FFFFFF"
-                                Text="实时信息" />
-                        </StackPanel>
-
-                        <StackPanel
-                            Grid.Column="1"
-                            Orientation="Horizontal"
-                            Spacing="6">
-                            <Border
-                                x:Name="PollutionCounterIndicator"
-                                Width="26"
-                                Height="26"
-                                Background="#2934D399"
-                                BorderBrush="#5534D399"
-                                BorderThickness="1"
-                                CornerRadius="6"
-                                ToolTipService.ToolTip="奇遇计数">
-                                <FontIcon
-                                    x:Name="PollutionCounterIcon"
-                                    HorizontalAlignment="Center"
-                                    VerticalAlignment="Center"
-                                    FontFamily="{StaticResource SymbolThemeFontFamily}"
-                                    FontSize="14"
-                                    Foreground="#34D399"
-                                    Glyph="&#xE9A3;" />
-                            </Border>
-                            <Border
-                                x:Name="AutoBattleIndicator"
-                                Width="26"
-                                Height="26"
-                                Background="#22FFFFFF"
-                                BorderBrush="#24FFFFFF"
-                                BorderThickness="1"
-                                CornerRadius="6"
-                                Opacity="0.72"
-                                ToolTipService.ToolTip="自动战斗">
-                                <FontIcon
-                                    x:Name="AutoBattleIcon"
-                                    HorizontalAlignment="Center"
-                                    VerticalAlignment="Center"
-                                    FontFamily="{StaticResource SymbolThemeFontFamily}"
-                                    FontSize="14"
-                                    Foreground="#8B95A1"
-                                    Glyph="&#xF272;" />
-                            </Border>
-                        </StackPanel>
-                    </Grid>
+                            FontFamily="{StaticResource SymbolThemeFontFamily}"
+                            FontSize="12"
+                            Foreground="#34D399"
+                            Glyph="&#xE9A3;" />
+                    </Border>
 
                     <Border
-                        Grid.Row="1"
-                        Height="1"
-                        Background="#24FFFFFF" />
+                        x:Name="AutoBattleIndicator"
+                        Grid.Column="3"
+                        Width="22"
+                        Height="22"
+                        Background="#22FFFFFF"
+                        BorderBrush="#24FFFFFF"
+                        BorderThickness="1"
+                        CornerRadius="11"
+                        Opacity="0.72"
+                        ToolTipService.ToolTip="自动战斗">
+                        <FontIcon
+                            x:Name="AutoBattleIcon"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            FontFamily="{StaticResource SymbolThemeFontFamily}"
+                            FontSize="12"
+                            Foreground="#8B95A1"
+                            Glyph="&#xF272;" />
+                    </Border>
 
-                    <Grid
-                        Grid.Row="2"
-                        ColumnSpacing="12">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-
-                        <StackPanel Spacing="2">
-                            <TextBlock
-                                FontSize="11"
-                                Foreground="#8993A2"
-                                Text="当前状态" />
-                            <TextBlock
-                                x:Name="StatusText"
-                                FontSize="16"
-                                FontWeight="SemiBold"
-                                Foreground="#34D399"
-                                MaxLines="1"
-                                Text="状态待识别"
-                                TextTrimming="CharacterEllipsis"
-                                TextWrapping="NoWrap" />
-                        </StackPanel>
-
-                        <StackPanel
-                            x:Name="MagicPointPanel"
-                            Grid.Column="1"
-                            HorizontalAlignment="Right"
-                            MinWidth="42"
-                            Spacing="2">
-                            <TextBlock
-                                HorizontalAlignment="Right"
-                                FontSize="11"
-                                Foreground="#8993A2"
-                                Text="魔力值" />
-                            <TextBlock
-                                x:Name="MagicPointText"
-                                HorizontalAlignment="Right"
-                                FontSize="13"
-                                FontWeight="SemiBold"
-                                Foreground="#34D399"
-                                Text="0/6" />
-                        </StackPanel>
-
-                        <StackPanel
-                            Grid.Column="2"
-                            HorizontalAlignment="Right"
-                            Spacing="2">
-                            <TextBlock
-                                HorizontalAlignment="Right"
-                                FontSize="11"
-                                Foreground="#8993A2"
-                                Text="时间" />
-                            <TextBlock
-                                x:Name="UpdatedAtText"
-                                HorizontalAlignment="Right"
-                                FontSize="13"
-                                FontWeight="SemiBold"
-                                Foreground="#CBD5E1"
-                                Text="--:--:--" />
-                        </StackPanel>
-                    </Grid>
+                    <StackPanel
+                        x:Name="MagicPointPanel"
+                        Grid.Column="4"
+                        VerticalAlignment="Center"
+                        Orientation="Horizontal"
+                        Spacing="3">
+                        <TextBlock
+                            VerticalAlignment="Center"
+                            FontSize="10"
+                            Foreground="#8093A2"
+                            Text="魔力" />
+                        <TextBlock
+                            x:Name="MagicPointText"
+                            VerticalAlignment="Center"
+                            FontSize="12"
+                            FontWeight="SemiBold"
+                            Foreground="#86EFAC"
+                            Text="0/6" />
+                    </StackPanel>
 
                     <Border
-                        Grid.Row="3"
-                        Height="1"
-                        Background="#24FFFFFF" />
+                        Grid.Column="5"
+                        Width="1"
+                        Height="16"
+                        VerticalAlignment="Center"
+                        Background="#2EFFFFFF" />
 
-                    <Grid
-                        Grid.Row="4"
-                        RowSpacing="6">
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="*" />
-                        </Grid.RowDefinitions>
-
-                        <Grid ColumnSpacing="10">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-
-                            <TextBlock
-                                FontSize="11"
-                                FontWeight="SemiBold"
-                                Foreground="#A7B0BE"
-                                Text="最近记录" />
-                            <TextBlock
-                                Grid.Column="1"
-                                FontSize="11"
-                                FontWeight="SemiBold"
-                                Foreground="#A7B0BE"
-                                Text="次数" />
-                        </Grid>
-
-                        <ScrollViewer
-                            Grid.Row="1"
-                            HorizontalScrollBarVisibility="Disabled"
-                            HorizontalScrollMode="Disabled"
-                            VerticalScrollBarVisibility="Hidden"
-                            VerticalScrollMode="Auto">
-                            <StackPanel
-                                x:Name="CounterList"
-                                Spacing="0" />
-                        </ScrollViewer>
-                    </Grid>
+                    <TextBlock
+                        x:Name="UpdatedAtText"
+                        Grid.Column="6"
+                        VerticalAlignment="Center"
+                        FontSize="11"
+                        Foreground="#99FFFFFF"
+                        Text="--:--:--" />
                 </Grid>
             </Grid>
         </Border>
