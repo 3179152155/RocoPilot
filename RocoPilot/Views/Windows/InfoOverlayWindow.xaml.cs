@@ -3,7 +3,6 @@ using System.Runtime.InteropServices;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
@@ -19,18 +18,18 @@ namespace RocoPilot.Views.Windows;
 
 public sealed partial class InfoOverlayWindow : WindowEx
 {
+    private const double CompactIslandHeight = 32d;
+    private const double DetailedIslandHeight = 44d;
+    private const string StatusDetailSeparator = " - ";
     private const int OverlayWidth = 400;
-    private const int OverlayHeight = 60;
-    private const int MinOverlayWidth = 280;
-    private const int MinOverlayHeight = 48;
-    private const int DefaultMargin = 12;
+    private const int OverlayHeight = 48;
+    private const int MinOverlayWidth = 156;
+    private const int MinOverlayHeight = 36;
+    private const int DefaultMargin = 0;
 
     private static readonly TimeSpan FollowInterval = TimeSpan.FromMilliseconds(250);
     private static readonly Color ActiveTaskIndicatorForeground = Color.FromArgb(0xFF, 0x34, 0xD3, 0x99);
-    private static readonly Color ActiveTaskIndicatorBackground = Color.FromArgb(0x29, 0x34, 0xD3, 0x99);
     private static readonly Color DisabledIndicatorForeground = Color.FromArgb(0xFF, 0x8B, 0x95, 0xA1);
-    private static readonly Color DisabledIndicatorBackground = Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF);
-    private static readonly Color DisabledIndicatorBorder = Color.FromArgb(0x24, 0xFF, 0xFF, 0xFF);
 
     private readonly CaptureTargetWindow _targetWindow;
     private readonly DispatcherQueueTimer _followTimer;
@@ -43,15 +42,13 @@ public sealed partial class InfoOverlayWindow : WindowEx
     private RectInt32 _dragStartOverlayBounds;
     private int _overlayOffsetX;
     private int _overlayOffsetY;
-    private int _lastMagicPointCount;
-    private int _lastMagicPointMaximum = 6;
     private DateTimeOffset? _lastCounterUpdate;
     private Storyboard? _stateDotPulse;
     private Storyboard? _statusTransition;
+    private Storyboard? _islandMorph;
     private Storyboard? _islandBulge;
     private string? _lastStatusText;
-    private bool _isEncounterStatisticsEnabled;
-    private bool _isAutoBattleEnabled;
+    private bool _hasStatusDetail;
     private bool _hasActivated;
     private bool _hasUserPositioned;
     private bool _isLocked;
@@ -142,22 +139,19 @@ public sealed partial class InfoOverlayWindow : WindowEx
         var statusText = string.IsNullOrWhiteSpace(snapshot.StatusText)
             ? "状态待识别"
             : snapshot.StatusText;
-        if (snapshot.MagicPointCount.HasValue)
-        {
-            var magicPointMaximum = Math.Max(1, snapshot.MagicPointMaximum);
-            _lastMagicPointMaximum = magicPointMaximum;
-            _lastMagicPointCount = Math.Clamp(snapshot.MagicPointCount.Value, 0, magicPointMaximum);
-        }
 
         if (!string.Equals(_lastStatusText, statusText, StringComparison.Ordinal))
         {
             _lastStatusText = statusText;
-            StatusText.Text = statusText;
+            var (primaryText, detailText) = SplitStatusText(statusText);
+            StatusPrimaryText.Text = primaryText;
+            StatusDetailText.Text = detailText ?? string.Empty;
+            StatusDetailText.Visibility = detailText is null
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+            MorphIsland(detailText is not null);
             AnimateStatusIn();
         }
-
-        MagicPointText.Text = $"{_lastMagicPointCount}/{_lastMagicPointMaximum}";
-        UpdatedAtText.Text = snapshot.UpdatedAt.ToLocalTime().ToString("HH:mm:ss");
 
         DateTimeOffset? latestCounterUpdate = snapshot.Counters.Count == 0
             ? null
@@ -174,52 +168,11 @@ public sealed partial class InfoOverlayWindow : WindowEx
 
     public void UpdateTaskIndicators(bool isEncounterStatisticsEnabled, bool isAutoBattleEnabled)
     {
-        _isEncounterStatisticsEnabled = isEncounterStatisticsEnabled;
-        _isAutoBattleEnabled = isAutoBattleEnabled;
-
-        SetTaskIndicator(
-            PollutionCounterIndicator,
-            PollutionCounterIcon,
-            isEncounterStatisticsEnabled,
-            ActiveTaskIndicatorForeground,
-            ActiveTaskIndicatorBackground);
-
-        SetTaskIndicator(
-            AutoBattleIndicator,
-            AutoBattleIcon,
-            isAutoBattleEnabled,
-            ActiveTaskIndicatorForeground,
-            ActiveTaskIndicatorBackground);
-
-        var isActive = _isEncounterStatisticsEnabled || _isAutoBattleEnabled;
+        var isActive = isEncounterStatisticsEnabled || isAutoBattleEnabled;
         StateDot.Fill = new SolidColorBrush(isActive
             ? ActiveTaskIndicatorForeground
             : DisabledIndicatorForeground);
         SyncStateDotPulse(isActive);
-    }
-
-    private static void SetTaskIndicator(
-        Border indicator,
-        FontIcon icon,
-        bool isEnabled,
-        Color activeForeground,
-        Color activeBackground)
-    {
-        indicator.Opacity = isEnabled ? 1d : 0.72d;
-        indicator.Background = new SolidColorBrush(isEnabled
-            ? activeBackground
-            : DisabledIndicatorBackground);
-        indicator.BorderBrush = new SolidColorBrush(isEnabled
-            ? WithAlpha(activeForeground, 0x66)
-            : DisabledIndicatorBorder);
-        icon.Foreground = new SolidColorBrush(isEnabled
-            ? activeForeground
-            : DisabledIndicatorForeground);
-    }
-
-    private static Color WithAlpha(Color color, byte alpha)
-    {
-        return Color.FromArgb(alpha, color.R, color.G, color.B);
     }
 
     private void ConfigurePresenter()
@@ -370,13 +323,64 @@ public sealed partial class InfoOverlayWindow : WindowEx
             Duration = new Duration(TimeSpan.FromMilliseconds(180)),
             EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
         };
-        Storyboard.SetTarget(fadeAnimation, StatusText);
+        Storyboard.SetTarget(fadeAnimation, StatusContent);
         Storyboard.SetTargetProperty(fadeAnimation, nameof(UIElement.Opacity));
 
         _statusTransition = new Storyboard();
         _statusTransition.Children.Add(translateAnimation);
         _statusTransition.Children.Add(fadeAnimation);
         _statusTransition.Begin();
+    }
+
+    private static (string PrimaryText, string? DetailText) SplitStatusText(string statusText)
+    {
+        var separatorIndex = statusText.IndexOf(StatusDetailSeparator, StringComparison.Ordinal);
+        if (separatorIndex < 0)
+        {
+            return (statusText, null);
+        }
+
+        var primaryText = statusText[..separatorIndex].Trim();
+        var detailText = statusText[(separatorIndex + StatusDetailSeparator.Length)..].Trim();
+        return string.IsNullOrWhiteSpace(detailText)
+            ? (primaryText, null)
+            : (primaryText, detailText);
+    }
+
+    private void MorphIsland(bool hasDetail)
+    {
+        if (_hasStatusDetail == hasDetail)
+        {
+            return;
+        }
+
+        _hasStatusDetail = hasDetail;
+        var currentHeight = InfoPanel.ActualHeight > 0
+            ? InfoPanel.ActualHeight
+            : InfoPanel.Height;
+        _islandMorph?.Stop();
+
+        var targetHeight = hasDetail ? DetailedIslandHeight : CompactIslandHeight;
+        InfoPanel.Height = targetHeight;
+        var heightAnimation = new DoubleAnimation
+        {
+            From = currentHeight,
+            To = targetHeight,
+            Duration = new Duration(TimeSpan.FromMilliseconds(220)),
+            EasingFunction = new BackEase
+            {
+                Amplitude = 0.25,
+                EasingMode = EasingMode.EaseOut
+            },
+            EnableDependentAnimation = true
+        };
+        Storyboard.SetTarget(heightAnimation, InfoPanel);
+        Storyboard.SetTargetProperty(heightAnimation, nameof(FrameworkElement.Height));
+
+        InfoPanel.CornerRadius = new CornerRadius(hasDetail ? 22 : 16);
+        _islandMorph = new Storyboard();
+        _islandMorph.Children.Add(heightAnimation);
+        _islandMorph.Begin();
     }
 
     private void SyncStateDotPulse(bool isActive)
@@ -513,6 +517,7 @@ public sealed partial class InfoOverlayWindow : WindowEx
         _followTimer.Stop();
         _stateDotPulse?.Stop();
         _statusTransition?.Stop();
+        _islandMorph?.Stop();
         _islandBulge?.Stop();
         _messageHook?.Dispose();
     }

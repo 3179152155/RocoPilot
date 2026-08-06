@@ -6,7 +6,7 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:windowex="using:WinUIEx"
     Width="400"
-    Height="60"
+    Height="48"
     mc:Ignorable="d">
 
     <Grid
@@ -17,13 +17,15 @@
         PointerReleased="OverlayRoot_PointerReleased">
         <Border
             x:Name="InfoPanel"
-            Height="52"
-            Margin="8,6,8,2"
-            Padding="14,0"
+            Width="156"
+            Height="32"
+            Padding="12,0"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Top"
             Background="#FF000000"
             BorderBrush="#24FFFFFF"
             BorderThickness="1"
-            CornerRadius="26"
+            CornerRadius="16"
             RenderTransformOrigin="0.5,0.5">
             <Border.RenderTransform>
                 <ScaleTransform
@@ -79,113 +81,45 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
 
                     <Ellipse
                         x:Name="StateDot"
-                        Width="8"
-                        Height="8"
+                        Width="7"
+                        Height="7"
                         VerticalAlignment="Center"
                         Fill="#34D399" />
 
-                    <TextBlock
-                        x:Name="StatusText"
+                    <StackPanel
+                        x:Name="StatusContent"
                         Grid.Column="1"
                         VerticalAlignment="Center"
-                        FontSize="14"
-                        FontWeight="SemiBold"
-                        Foreground="#FFFFFFFF"
-                        MaxLines="1"
-                        Text="状态待识别"
-                        TextTrimming="CharacterEllipsis"
-                        TextWrapping="NoWrap">
-                        <TextBlock.RenderTransform>
+                        Spacing="0">
+                        <StackPanel.RenderTransform>
                             <TranslateTransform
                                 x:Name="StatusShift"
                                 Y="0" />
-                        </TextBlock.RenderTransform>
-                    </TextBlock>
+                        </StackPanel.RenderTransform>
 
-                    <Border
-                        x:Name="PollutionCounterIndicator"
-                        Grid.Column="2"
-                        Width="22"
-                        Height="22"
-                        Background="#2934D399"
-                        BorderBrush="#5534D399"
-                        BorderThickness="1"
-                        CornerRadius="11"
-                        ToolTipService.ToolTip="奇遇计数">
-                        <FontIcon
-                            x:Name="PollutionCounterIcon"
-                            HorizontalAlignment="Center"
-                            VerticalAlignment="Center"
-                            FontFamily="{StaticResource SymbolThemeFontFamily}"
-                            FontSize="12"
-                            Foreground="#34D399"
-                            Glyph="&#xE9A3;" />
-                    </Border>
-
-                    <Border
-                        x:Name="AutoBattleIndicator"
-                        Grid.Column="3"
-                        Width="22"
-                        Height="22"
-                        Background="#22FFFFFF"
-                        BorderBrush="#24FFFFFF"
-                        BorderThickness="1"
-                        CornerRadius="11"
-                        Opacity="0.72"
-                        ToolTipService.ToolTip="自动战斗">
-                        <FontIcon
-                            x:Name="AutoBattleIcon"
-                            HorizontalAlignment="Center"
-                            VerticalAlignment="Center"
-                            FontFamily="{StaticResource SymbolThemeFontFamily}"
-                            FontSize="12"
-                            Foreground="#8B95A1"
-                            Glyph="&#xF272;" />
-                    </Border>
-
-                    <StackPanel
-                        x:Name="MagicPointPanel"
-                        Grid.Column="4"
-                        VerticalAlignment="Center"
-                        Orientation="Horizontal"
-                        Spacing="3">
                         <TextBlock
-                            VerticalAlignment="Center"
-                            FontSize="10"
-                            Foreground="#8093A2"
-                            Text="魔力" />
-                        <TextBlock
-                            x:Name="MagicPointText"
-                            VerticalAlignment="Center"
-                            FontSize="12"
+                            x:Name="StatusPrimaryText"
+                            FontSize="13"
                             FontWeight="SemiBold"
-                            Foreground="#86EFAC"
-                            Text="0/6" />
+                            Foreground="#FFFFFFFF"
+                            MaxLines="1"
+                            Text="状态待识别"
+                            TextTrimming="CharacterEllipsis"
+                            TextWrapping="NoWrap" />
+                        <TextBlock
+                            x:Name="StatusDetailText"
+                            FontSize="10"
+                            FontWeight="SemiBold"
+                            Foreground="#FF34D399"
+                            MaxLines="1"
+                            TextTrimming="CharacterEllipsis"
+                            TextWrapping="NoWrap"
+                            Visibility="Collapsed" />
                     </StackPanel>
-
-                    <Border
-                        Grid.Column="5"
-                        Width="1"
-                        Height="16"
-                        VerticalAlignment="Center"
-                        Background="#2EFFFFFF" />
-
-                    <TextBlock
-                        x:Name="UpdatedAtText"
-                        Grid.Column="6"
-                        VerticalAlignment="Center"
-                        FontSize="11"
-                        Foreground="#99FFFFFF"
-                        Text="--:--:--" />
                 </Grid>
             </Grid>
         </Border>
