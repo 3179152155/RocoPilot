@@ -18,5 +18,7 @@ internal sealed class ScrapedSpiritState
 
     public bool IsPrimaryForm { get; init; }
 
+    public bool IsChainStart { get; init; }
+
     public int StageRank { get; set; }
 }
