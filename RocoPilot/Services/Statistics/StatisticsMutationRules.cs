@@ -1,6 +1,7 @@
 using RocoPilot.Helpers;
 using RocoPilot.Models.Encounters;
 using RocoPilot.Models.Statistics;
+using RocoPilot.Services.Encounters;
 
 namespace RocoPilot.Services.Statistics;
 
@@ -32,6 +33,44 @@ internal static class StatisticsMutationRules
         record.Count++; 
         record.Season = season.Id;
         record.LastCapturedAt = capturedAt;
+    }
+
+    public static void AddPendingEncounter(
+        AccountStatisticsData account,
+        EncounterSeasonDefinition season,
+        string id,
+        string rawText,
+        DateTimeOffset detectedAt,
+        string? spiritName = null)
+    {
+        if (account.PendingEncounters.Any(item => item.Id == id)) return;
+        if (season.Id != EncounterSeasonTimeline.PendingSeasonId) ResolveSeason(account, season);
+        account.PendingEncounters.Add(new PendingEncounterRecord
+        {
+            Id = id,
+            Season = season.Id,
+            RawText = rawText,
+            Name = string.IsNullOrWhiteSpace(spiritName) ? null : spiritName.Trim(),
+            DetectedAt = detectedAt
+        });
+    }
+
+    public static PendingEncounterConfirmationResult ConfirmPendingEncounter(
+        AccountStatisticsData account, string id, string spiritName)
+    {
+        var pending = account.PendingEncounters.FirstOrDefault(item => item.Id == id && item.HandledAt is null);
+        if (pending is null) return PendingEncounterConfirmationResult.NotFound;
+        pending.Name = spiritName;
+        if (pending.Season == EncounterSeasonTimeline.PendingSeasonId)
+            return PendingEncounterConfirmationResult.AwaitingSeason;
+        var season = ResolveSeason(account, pending.Season);
+        if (season.EncounterCountResets.Any(reset =>
+                TextMatchingHelper.AreSameSpiritName(reset.Name, spiritName) && reset.ResetAt >= pending.DetectedAt))
+            return PendingEncounterConfirmationResult.BeforeReset;
+
+        UpsertEncounter(account, pending.Season, spiritName, 1, pending.DetectedAt);
+        pending.HandledAt = DateTimeOffset.Now;
+        return PendingEncounterConfirmationResult.Counted;
     }
 
     public static void UpsertEncounter(
@@ -154,6 +193,7 @@ internal static class StatisticsMutationRules
         {
             seasonData.Encounters.Remove(encounter);
         }
+        RememberEncounterReset(seasonData, spiritName, DateTimeOffset.Now);
     }
 
     public static void DeleteShinyCaptures(AccountStatisticsData account, string? seasonId, string spiritName)
@@ -201,7 +241,8 @@ internal static class StatisticsMutationRules
         _ = ResolveSeason(account, season);
 
         var pendingCapture = account.PendingShinyCaptures.FirstOrDefault(item =>
-            string.Equals(item.Season, season.Id, StringComparison.OrdinalIgnoreCase)
+            season.Id != EncounterSeasonTimeline.PendingSeasonId
+            && string.Equals(item.Season, season.Id, StringComparison.OrdinalIgnoreCase)
             && TextMatchingHelper.AreSameSpiritName(item.Name, spiritName));
         if (pendingCapture is null)
         {
@@ -233,6 +274,9 @@ internal static class StatisticsMutationRules
             return;
         }
 
+        if (pendingCapture.Season == EncounterSeasonTimeline.PendingSeasonId)
+            throw new InvalidOperationException("该异色的赛季尚未确定，请等待软件更新赛季配置后确认。");
+
         var originalName = pendingCapture.Name;
         var seasonId = pendingCapture.Season;
         account.PendingShinyCaptures.Remove(pendingCapture);
@@ -248,6 +292,9 @@ internal static class StatisticsMutationRules
                 : pendingCapture.DetectedAt,
             EncounterCountBeforeCapture = encounterCount
         });
+
+        RememberEncounterReset(seasonData, originalName, confirmedAt);
+        RememberEncounterReset(seasonData, spiritName, confirmedAt);
 
         foreach (var encounter in seasonData.Encounters
             .Where(item => TextMatchingHelper.AreSameSpiritName(item.Name, originalName)
@@ -267,7 +314,7 @@ internal static class StatisticsMutationRules
         }
     }
 
-    private static SeasonStatisticsData ResolveSeason(
+    internal static SeasonStatisticsData ResolveSeason(
         AccountStatisticsData account,
         EncounterSeasonDefinition season)
     {
@@ -358,6 +405,15 @@ internal static class StatisticsMutationRules
     {
         return account.PendingShinyCaptures.FirstOrDefault(item =>
             string.Equals(item.Id, pendingCaptureId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void RememberEncounterReset(SeasonStatisticsData season, string name, DateTimeOffset resetAt)
+    {
+        var reset = season.EncounterCountResets.FirstOrDefault(item => TextMatchingHelper.AreSameSpiritName(item.Name, name));
+        if (reset is null)
+            season.EncounterCountResets.Add(new EncounterCountResetRecord { Name = name, ResetAt = resetAt });
+        else
+            reset.ResetAt = Max(reset.ResetAt, resetAt);
     }
 
     private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right)

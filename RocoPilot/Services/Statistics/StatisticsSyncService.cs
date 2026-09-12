@@ -1,96 +1,95 @@
-using System.Globalization;
-using System.Net;
-using System.Net.Http.Headers;
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-
 using Microsoft.Extensions.Logging;
 
 using RocoPilot.Configuration;
 using RocoPilot.Contracts.Services;
 using RocoPilot.Contracts.Services.Statistics;
 using RocoPilot.Models.Statistics;
+using RocoPilot.Services.Statistics.Sync;
 
-using Windows.Security.Credentials;
+using static RocoPilot.Services.Statistics.Sync.StatisticsSyncRules;
 
 namespace RocoPilot.Services.Statistics;
 
 public sealed class StatisticsSyncService : IStatisticsSyncService
 {
-    private const string CloudflareR2ProviderId = "cloudflare-r2";
-    private const string CredentialResource = "RocoPilot.StatisticsSync";
-    private const string S3Region = "auto";
-    private const string S3Service = "s3";
-    private const string S3Algorithm = "AWS4-HMAC-SHA256";
     private const int MaxConditionalUploadAttempts = 3;
     private static readonly TimeSpan AutoUploadDelay = TimeSpan.FromSeconds(8);
-
-    private static readonly IReadOnlyList<StatisticsSyncProviderOption> ProviderOptions =
-    [
-        new()
-        {
-            Id = CloudflareR2ProviderId,
-            Name = "Cloudflare R2",
-            Kind = StatisticsSyncProviderKinds.S3,
-            DefaultEndpoint = string.Empty,
-            DefaultRemotePath = "RocoPilot/statistics.json"
-        }
-    ];
-
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = true
-    };
 
     private readonly ILocalSettingsService _localSettingsService;
     private readonly IStatisticsService _statisticsService;
     private readonly ILogger<StatisticsSyncService> _logger;
-    private readonly HttpClient _httpClient = CreateHttpClient();
+    private readonly IStatisticsRemoteStore _remoteStore;
+    private readonly IStatisticsSyncCredentialStore _credentials;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
-    private readonly object _autoUploadLock = new();
+    private readonly SemaphoreSlim _settingsGate = new(1, 1);
+    private readonly StatisticsAutoUploadScheduler _autoUpload;
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly object _disposeGate = new();
+    private readonly object _statusGate = new();
+    private Task? _disposeTask;
+    private bool _stopping;
 
     private StatisticsSyncSettings _settings = CreateDefaultSettings();
     private StatisticsSyncStatus _status = new();
-    private CancellationTokenSource? _autoUploadCts;
     private bool _isSettingsLoaded;
-    private bool _suspendAutoUpload;
 
     public event EventHandler<StatisticsSyncStatusChangedEventArgs>? StatusChanged;
 
-    public StatisticsSyncStatus CurrentStatus => CloneStatus(_status);
+    public StatisticsSyncStatus CurrentStatus
+    {
+        get { lock (_statusGate) return CloneStatus(_status); }
+    }
 
     public StatisticsSyncService(
         ILocalSettingsService localSettingsService,
         IStatisticsService statisticsService,
-        ILogger<StatisticsSyncService> logger)
+        ILogger<StatisticsSyncService> logger,
+        IStatisticsRemoteStore remoteStore,
+        IStatisticsSyncCredentialStore credentials)
+        : this(localSettingsService, statisticsService, logger, remoteStore, credentials, Task.Delay)
+    {
+    }
+
+    internal StatisticsSyncService(
+        ILocalSettingsService localSettingsService,
+        IStatisticsService statisticsService,
+        ILogger<StatisticsSyncService> logger,
+        IStatisticsRemoteStore remoteStore,
+        IStatisticsSyncCredentialStore credentials,
+        Func<TimeSpan, CancellationToken, Task> delay)
     {
         _localSettingsService = localSettingsService;
         _statisticsService = statisticsService;
         _logger = logger;
+        _remoteStore = remoteStore;
+        _credentials = credentials;
+        _autoUpload = new StatisticsAutoUploadScheduler(AutoUploadDelay,
+            token => UploadAsync(automatic: true, token),
+            ex => _logger.LogWarning(ex, "自动上传统计数据失败。"), delay);
         _statisticsService.DocumentChanged += StatisticsService_DocumentChanged;
         ApplyStatusFromSettings(_settings, "未配置云同步");
     }
 
     public IReadOnlyList<StatisticsSyncProviderOption> GetProviders()
     {
-        return ProviderOptions.Select(CloneProvider).ToList();
+        return GetProviderOptions();
     }
 
     public async Task<StatisticsSyncSettings> LoadSettingsAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         cancellationToken.ThrowIfCancellationRequested();
-        return CloneSettings(await LoadSettingsCoreAsync());
+        return CloneSettings(await LoadSettingsCoreAsync(cancellationToken));
     }
 
     public async Task<StatisticsSyncStatus> LoadStatusAsync(CancellationToken cancellationToken = default)
     {
-        var settings = await LoadSettingsCoreAsync();
-        ApplyStatusFromSettings(settings, BuildIdleMessage(settings));
-        return CloneStatus(_status);
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
+        var settings = await LoadSettingsCoreAsync(cancellationToken);
+        ApplyStatusFromSettings(settings, BuildIdleMessage(settings), onlyWhenIdle: true);
+        return CurrentStatus;
     }
 
     public async Task<StatisticsSyncStatus> SaveSettingsAsync(
@@ -98,10 +97,12 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         string? password,
         CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
-            var currentSettings = await LoadSettingsCoreAsync();
+            var currentSettings = await LoadSettingsCoreAsync(cancellationToken);
             var normalizedSettings = NormalizeSettings(settings);
             if (AreSameRemoteTarget(currentSettings, normalizedSettings))
             {
@@ -115,12 +116,13 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
             ValidateSettingsForSave(normalizedSettings, password);
             if (!string.IsNullOrEmpty(password))
             {
-                SavePassword(normalizedSettings.UserName, password);
+                _credentials.Save(normalizedSettings.UserName, password);
             }
 
             await SaveSettingsCoreAsync(normalizedSettings, cancellationToken);
+            if (!normalizedSettings.IsEnabled) _autoUpload.CancelPending();
             ApplyStatusFromSettings(normalizedSettings, normalizedSettings.IsEnabled ? "云同步设置已保存" : "云同步未启用");
-            return CloneStatus(_status);
+            return CurrentStatus;
         }
         finally
         {
@@ -128,7 +130,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         }
     }
 
-    private static void ValidateSettingsForSave(StatisticsSyncSettings settings, string? password)
+    private void ValidateSettingsForSave(StatisticsSyncSettings settings, string? password)
     {
         if (!settings.IsEnabled)
         {
@@ -140,7 +142,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
             throw new InvalidOperationException("启用云同步前，请先填写 Account ID、Bucket 和 Access Key ID。");
         }
 
-        if (string.IsNullOrWhiteSpace(password) && string.IsNullOrEmpty(ReadPassword(settings.UserName)))
+        if (string.IsNullOrWhiteSpace(password) && string.IsNullOrEmpty(_credentials.Read(settings.UserName)))
         {
             throw new InvalidOperationException("启用云同步前，请先填写 Secret Access Key。");
         }
@@ -148,16 +150,19 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
     public async Task<StatisticsSyncRemoteInfo> RefreshRemoteInfoAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
             var (settings, password) = await LoadConfiguredSettingsAsync(cancellationToken);
             SetBusy(true, "正在读取云端时间");
-            var info = await ReadRemoteInfoCoreAsync(settings, password, cancellationToken);
+            var info = await _remoteStore.ReadInfoAsync(settings, password, cancellationToken);
             await SaveRemoteInfoAsync(settings, info, cancellationToken);
             ApplyStatusFromSettings(settings, info.Exists ? "已更新云端时间" : "云端暂无统计数据");
             return info;
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             SetFailureStatus("读取云端时间失败", ex);
@@ -172,12 +177,14 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
     public async Task<StatisticsSyncResult> TestConnectionAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
             var (settings, password) = await LoadConfiguredSettingsAsync(cancellationToken);
             SetBusy(true, "正在测试云同步连接");
-            var info = await ReadRemoteInfoCoreAsync(settings, password, cancellationToken);
+            var info = await _remoteStore.ReadInfoAsync(settings, password, cancellationToken);
             await SaveRemoteInfoAsync(settings, info, cancellationToken);
             var result = new StatisticsSyncResult
             {
@@ -190,6 +197,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
             ApplyStatusFromSettings(settings, info.Exists ? "连接成功，已读取云端文件" : "连接成功，云端暂无统计数据");
             return result;
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             SetFailureStatus("云同步连接失败", ex);
@@ -204,10 +212,12 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
     public async Task<bool> DownloadRemoteChangesIfNeededAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
-            var settings = await LoadSettingsCoreAsync();
+            var settings = await LoadSettingsCoreAsync(cancellationToken);
             if (!settings.IsEnabled || !HasRequiredSettings(settings))
             {
                 ApplyStatusFromSettings(settings, BuildIdleMessage(settings));
@@ -216,7 +226,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
             var (_, password) = await LoadConfiguredSettingsAsync(cancellationToken);
             SetBusy(true, "正在检查云端统计更新");
-            var remoteInfo = await ReadRemoteInfoCoreAsync(settings, password, cancellationToken);
+            var remoteInfo = await _remoteStore.ReadInfoAsync(settings, password, cancellationToken);
             await SaveRemoteInfoAsync(settings, remoteInfo, cancellationToken);
             if (!remoteInfo.Exists)
             {
@@ -261,6 +271,8 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
     public async Task<StatisticsSyncResult> DownloadAsync(CancellationToken cancellationToken = default)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
@@ -294,41 +306,22 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         string successMessage,
         CancellationToken cancellationToken)
     {
-        using var response = await SendDownloadRequestAsync(settings, password, cancellationToken);
-        var json = await response.Content.ReadAsStringAsync(cancellationToken);
-        var remoteDocument = DeserializeDocument(json);
-        var downloadedRemoteInfo = new StatisticsSyncRemoteInfo
-        {
-            Exists = true,
-            LastModifiedAt = ReadLastModified(response),
-            ContentLength = response.Content.Headers.ContentLength,
-            EntityTag = ReadEntityTag(response),
-            CheckedAt = DateTimeOffset.Now
-        };
-        var localDocument = await _statisticsService.LoadAsync();
-        var mergeResult = StatisticsDocumentMerger.Merge(
-            localDocument,
+        var downloaded = await _remoteStore.DownloadAsync(settings, password, cancellationToken);
+        var remoteDocument = downloaded.Document;
+        var downloadedRemoteInfo = downloaded.Info;
+        var mergeResult = await _statisticsService.MergeRemoteAsync(
             remoteDocument,
             settings.LastSyncedAccountFingerprints,
             preferRemoteAccountsWithoutBaseline:
                 settings.LastSyncedAccountFingerprints is null
                 && HasRecordedSyncVersion(settings)
-                && HasRemoteChangedSinceLastSync(settings, downloadedRemoteInfo));
+                && HasRemoteChangedSinceLastSync(settings, downloadedRemoteInfo),
+            cancellationToken);
         if (mergeResult.ConflictingAccountUids.Count > 0)
         {
             _logger.LogWarning(
                 "云同步检测到同一账号在本地和云端都发生变化，已采用云端版本：{AccountUids}",
                 string.Join(", ", mergeResult.ConflictingAccountUids));
-        }
-
-        _suspendAutoUpload = true;
-        try
-        {
-            await _statisticsService.ReplaceAsync(mergeResult.Document);
-        }
-        finally
-        {
-            _suspendAutoUpload = false;
         }
 
         var completedAt = DateTimeOffset.Now;
@@ -354,15 +347,23 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
 
     private async Task<StatisticsSyncResult> UploadAsync(bool automatic, CancellationToken cancellationToken)
     {
+        using var operation = CreateOperationCancellation(cancellationToken);
+        cancellationToken = operation.Token;
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
+            if (automatic)
+            {
+                var automaticSettings = await LoadSettingsCoreAsync(cancellationToken);
+                if (!automaticSettings.IsEnabled || !HasRequiredSettings(automaticSettings))
+                    return new StatisticsSyncResult();
+            }
             var (settings, password) = await LoadConfiguredSettingsAsync(cancellationToken);
             var mergedRemoteChanges = false;
             for (var attempt = 1; attempt <= MaxConditionalUploadAttempts; attempt++)
             {
                 SetBusy(true, automatic ? "正在自动上传统计数据" : "正在上传统计数据");
-                var currentRemoteInfo = await ReadRemoteInfoCoreAsync(settings, password, cancellationToken);
+                var currentRemoteInfo = await _remoteStore.ReadInfoAsync(settings, password, cancellationToken);
                 if (HasRemoteChangedSinceLastSync(settings, currentRemoteInfo))
                 {
                     SetBusy(true, "检测到云端更新，正在先同步到本地");
@@ -383,14 +384,8 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
                 }
 
                 var document = await _statisticsService.LoadAsync();
-                var payload = Encoding.UTF8.GetBytes(SerializeDocument(document));
-                using var response = await SendUploadRequestAsync(
-                    settings,
-                    password,
-                    payload,
-                    currentRemoteInfo,
-                    cancellationToken);
-                if (response.StatusCode == HttpStatusCode.PreconditionFailed)
+                var upload = await _remoteStore.UploadAsync(settings, password, document, currentRemoteInfo, cancellationToken);
+                if (upload.HasConflict)
                 {
                     if (attempt < MaxConditionalUploadAttempts)
                     {
@@ -401,20 +396,8 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
                     throw new InvalidOperationException("上传期间云端数据连续发生变化，已停止上传以避免覆盖，请稍后重试。");
                 }
 
-                await EnsureSuccessAsync(response, cancellationToken);
-                var completedAt = DateTimeOffset.Now;
-                var result = new StatisticsSyncResult
-                {
-                    CompletedAt = completedAt,
-                    RemoteLastModifiedAt = ReadLastModified(response) ?? completedAt,
-                    ContentLength = payload.LongLength,
-                    EntityTag = ReadEntityTag(response)
-                };
-                if (string.IsNullOrWhiteSpace(result.EntityTag))
-                {
-                    throw new InvalidOperationException(
-                        "云端已接收上传，但没有返回用于并发校验的 ETag；本地未记录本次同步基线，下次将重新检查云端。");
-                }
+                var result = upload.Result ?? throw new InvalidOperationException("云端未返回上传结果。");
+                var completedAt = result.CompletedAt;
 
                 settings.LastUploadedAt = completedAt;
                 settings.LastRemoteCheckedAt = completedAt;
@@ -442,13 +425,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         catch (Exception ex)
         {
             SetFailureStatus(automatic ? "自动上传统计失败" : "上传统计失败", ex);
-            if (!automatic)
-            {
-                throw;
-            }
-
-            _logger.LogWarning(ex, "自动上传统计数据失败。");
-            return new StatisticsSyncResult { CompletedAt = DateTimeOffset.Now };
+            throw;
         }
         finally
         {
@@ -457,56 +434,14 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         }
     }
 
-    private async void StatisticsService_DocumentChanged(object? sender, StatisticsDocumentChangedEventArgs e)
+    private void StatisticsService_DocumentChanged(object? sender, StatisticsDocumentChangedEventArgs e)
     {
-        if (_suspendAutoUpload)
-        {
-            return;
-        }
-
-        try
-        {
-            var settings = await LoadSettingsCoreAsync();
-            if (!settings.IsEnabled || !HasRequiredSettings(settings))
-            {
-                return;
-            }
-
-            QueueAutoUpload();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "准备自动上传统计数据失败。");
-        }
-    }
-
-    private void QueueAutoUpload()
-    {
-        CancellationToken token;
-        lock (_autoUploadLock)
-        {
-            _autoUploadCts?.Cancel();
-            _autoUploadCts?.Dispose();
-            _autoUploadCts = new CancellationTokenSource();
-            token = _autoUploadCts.Token;
-        }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(AutoUploadDelay, token);
-                await UploadAsync(automatic: true, token);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }, token);
+        if (e.Source == StatisticsDocumentChangeSource.Local) _autoUpload.Request();
     }
 
     private async Task<(StatisticsSyncSettings Settings, string Password)> LoadConfiguredSettingsAsync(CancellationToken cancellationToken)
     {
-        var settings = await LoadSettingsCoreAsync();
+        var settings = await LoadSettingsCoreAsync(cancellationToken);
         if (!settings.IsEnabled)
         {
             throw new InvalidOperationException("请先启用云同步。");
@@ -522,7 +457,7 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
             throw new NotSupportedException($"暂不支持 {settings.ProviderKind} 同步方式。");
         }
 
-        var password = ReadPassword(settings.UserName);
+        var password = _credentials.Read(settings.UserName);
         if (string.IsNullOrEmpty(password))
         {
             throw new InvalidOperationException("未保存 Secret Access Key，请在云同步设置中重新输入。");
@@ -532,25 +467,40 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         return (settings, password);
     }
 
-    private async Task<StatisticsSyncSettings> LoadSettingsCoreAsync()
+    private async Task<StatisticsSyncSettings> LoadSettingsCoreAsync(CancellationToken cancellationToken)
     {
-        if (_isSettingsLoaded)
+        await _settingsGate.WaitAsync(cancellationToken);
+        try
         {
+            if (!_isSettingsLoaded)
+            {
+                var savedSettings = await _localSettingsService.ReadSettingAsync<StatisticsSyncSettings>(SettingsKeys.StatisticsSyncSettings);
+                cancellationToken.ThrowIfCancellationRequested();
+                _settings = NormalizeSettings(savedSettings ?? CreateDefaultSettings());
+                _isSettingsLoaded = true;
+            }
             return CloneSettings(_settings);
         }
-
-        var savedSettings = await _localSettingsService.ReadSettingAsync<StatisticsSyncSettings>(SettingsKeys.StatisticsSyncSettings);
-        _settings = NormalizeSettings(savedSettings ?? CreateDefaultSettings());
-        _isSettingsLoaded = true;
-        return CloneSettings(_settings);
+        finally
+        {
+            _settingsGate.Release();
+        }
     }
 
     private async Task SaveSettingsCoreAsync(StatisticsSyncSettings settings, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        _settings = NormalizeSettings(settings);
-        _isSettingsLoaded = true;
-        await _localSettingsService.SaveSettingAsync(SettingsKeys.StatisticsSyncSettings, _settings);
+        await _settingsGate.WaitAsync(cancellationToken);
+        try
+        {
+            var nextSettings = NormalizeSettings(settings);
+            await _localSettingsService.SaveSettingAsync(SettingsKeys.StatisticsSyncSettings, nextSettings);
+            _settings = nextSettings;
+            _isSettingsLoaded = true;
+        }
+        finally
+        {
+            _settingsGate.Release();
+        }
     }
 
     private async Task SaveRemoteInfoAsync(
@@ -564,716 +514,84 @@ public sealed class StatisticsSyncService : IStatisticsSyncService
         await SaveSettingsCoreAsync(settings, cancellationToken);
     }
 
-    private async Task<StatisticsSyncRemoteInfo> ReadRemoteInfoCoreAsync(
-        StatisticsSyncSettings settings,
-        string password,
-        CancellationToken cancellationToken)
+    private void ApplyStatusFromSettings(StatisticsSyncSettings settings, string message, bool onlyWhenIdle = false)
     {
-        using var request = CreateS3Request(settings, HttpMethod.Head, password, []);
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        if (response.IsSuccessStatusCode)
+        StatisticsSyncStatus snapshot;
+        lock (_statusGate)
         {
-            return new StatisticsSyncRemoteInfo
+            if (onlyWhenIdle && _status.IsBusy) return;
+            var provider = ResolveProvider(settings.ProviderId);
+            _status = new StatisticsSyncStatus
             {
-                Exists = true,
-                LastModifiedAt = ReadLastModified(response),
-                ContentLength = response.Content.Headers.ContentLength,
-                EntityTag = ReadEntityTag(response),
-                CheckedAt = DateTimeOffset.Now
+                IsConfigured = HasRequiredSettings(settings), IsEnabled = settings.IsEnabled,
+                IsBusy = _status.IsBusy, ProviderId = settings.ProviderId, ProviderName = provider.Name,
+                Message = message, RemoteLastModifiedAt = settings.LastRemoteModifiedAt,
+                LastUploadedAt = settings.LastUploadedAt, LastDownloadedAt = settings.LastDownloadedAt,
+                LastRemoteCheckedAt = settings.LastRemoteCheckedAt, RemoteEntityTag = settings.LastRemoteEntityTag
             };
+            snapshot = CloneStatus(_status);
         }
-
-        if (response.StatusCode == HttpStatusCode.NotFound)
-        {
-            return new StatisticsSyncRemoteInfo
-            {
-                Exists = false,
-                CheckedAt = DateTimeOffset.Now
-            };
-        }
-
-        await EnsureSuccessAsync(response, cancellationToken);
-        return new StatisticsSyncRemoteInfo
-        {
-            Exists = false,
-            CheckedAt = DateTimeOffset.Now
-        };
-    }
-
-    private async Task<HttpResponseMessage> SendDownloadRequestAsync(
-        StatisticsSyncSettings settings,
-        string password,
-        CancellationToken cancellationToken)
-    {
-        using var request = CreateS3Request(settings, HttpMethod.Get, password, []);
-        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        if (response.StatusCode == HttpStatusCode.NotFound)
-        {
-            response.Dispose();
-            throw new InvalidOperationException("云端还没有统计数据，请先上传一次。");
-        }
-
-        await EnsureSuccessAsync(response, cancellationToken);
-        return response;
-    }
-
-    private async Task<HttpResponseMessage> SendUploadRequestAsync(
-        StatisticsSyncSettings settings,
-        string password,
-        byte[] payload,
-        StatisticsSyncRemoteInfo expectedRemoteInfo,
-        CancellationToken cancellationToken)
-    {
-        using var request = CreateS3Request(
-            settings,
-            HttpMethod.Put,
-            password,
-            payload,
-            expectedRemoteInfo);
-        return await _httpClient.SendAsync(request, cancellationToken);
-    }
-
-    private static HttpRequestMessage CreateS3Request(
-        StatisticsSyncSettings settings,
-        HttpMethod method,
-        string secretAccessKey,
-        byte[] payload,
-        StatisticsSyncRemoteInfo? expectedRemoteInfo = null)
-    {
-        var uri = BuildS3ObjectUri(settings);
-        var request = new HttpRequestMessage(method, uri);
-        if (method == HttpMethod.Put)
-        {
-            request.Content = new ByteArrayContent(payload);
-            request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
-            {
-                CharSet = Encoding.UTF8.WebName
-            };
-        }
-
-        request.Headers.UserAgent.ParseAdd("RocoPilot");
-        if (method == HttpMethod.Put && expectedRemoteInfo is not null)
-        {
-            ApplyUploadCondition(request, expectedRemoteInfo);
-        }
-
-        SignS3Request(request, settings.UserName, secretAccessKey, payload);
-        return request;
-    }
-
-    private static void ApplyUploadCondition(
-        HttpRequestMessage request,
-        StatisticsSyncRemoteInfo expectedRemoteInfo)
-    {
-        if (!expectedRemoteInfo.Exists)
-        {
-            request.Headers.IfNoneMatch.Add(EntityTagHeaderValue.Any);
-            return;
-        }
-
-        var entityTag = NormalizeEntityTag(expectedRemoteInfo.EntityTag);
-        if (!string.IsNullOrWhiteSpace(entityTag))
-        {
-            request.Headers.IfMatch.Add(new EntityTagHeaderValue($"\"{entityTag}\""));
-            return;
-        }
-
-        if (expectedRemoteInfo.LastModifiedAt is not null)
-        {
-            request.Headers.IfUnmodifiedSince = expectedRemoteInfo.LastModifiedAt.Value.ToUniversalTime();
-            return;
-        }
-
-        throw new InvalidOperationException("云端没有返回 ETag 或更新时间，无法安全地执行覆盖上传。");
-    }
-
-    private static void SignS3Request(
-        HttpRequestMessage request,
-        string accessKeyId,
-        string secretAccessKey,
-        byte[] payload)
-    {
-        var now = DateTimeOffset.UtcNow;
-        var amzDate = now.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
-        var dateStamp = now.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
-        var credentialScope = $"{dateStamp}/{S3Region}/{S3Service}/aws4_request";
-        var payloadHash = ComputeSha256Hex(payload);
-        var host = BuildCanonicalHost(request.RequestUri!);
-
-        request.Headers.Host = host;
-        request.Headers.TryAddWithoutValidation("x-amz-content-sha256", payloadHash);
-        request.Headers.TryAddWithoutValidation("x-amz-date", amzDate);
-
-        const string signedHeaders = "host;x-amz-content-sha256;x-amz-date";
-        var canonicalHeaders =
-            $"host:{host}\n" +
-            $"x-amz-content-sha256:{payloadHash}\n" +
-            $"x-amz-date:{amzDate}\n";
-        var canonicalRequest = string.Join('\n',
-            request.Method.Method,
-            request.RequestUri!.AbsolutePath,
-            string.Empty,
-            canonicalHeaders,
-            signedHeaders,
-            payloadHash);
-        var stringToSign = string.Join('\n',
-            S3Algorithm,
-            amzDate,
-            credentialScope,
-            ComputeSha256Hex(Encoding.UTF8.GetBytes(canonicalRequest)));
-        var signingKey = BuildS3SigningKey(secretAccessKey, dateStamp);
-        var signature = ToHexString(HmacSha256(signingKey, stringToSign));
-        request.Headers.TryAddWithoutValidation(
-            "Authorization",
-            $"{S3Algorithm} Credential={accessKeyId.Trim()}/{credentialScope}, SignedHeaders={signedHeaders}, Signature={signature}");
-    }
-
-    private static Uri BuildS3ObjectUri(StatisticsSyncSettings settings)
-    {
-        var endpoint = BuildS3Endpoint(settings.Endpoint);
-        var bucketName = Uri.EscapeDataString(settings.BucketName.Trim());
-        var objectKey = string.Join("/", SplitRemotePath(settings.RemotePath).Select(Uri.EscapeDataString));
-        return new Uri(endpoint, $"{bucketName}/{objectKey}");
-    }
-
-    private static Uri BuildS3Endpoint(string accountIdOrEndpoint)
-    {
-        var endpoint = accountIdOrEndpoint.Trim();
-        if (!endpoint.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-            && !endpoint.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-        {
-            endpoint = $"https://{endpoint}.r2.cloudflarestorage.com";
-        }
-
-        if (!endpoint.EndsWith("/", StringComparison.Ordinal))
-        {
-            endpoint += "/";
-        }
-
-        return new Uri(endpoint, UriKind.Absolute);
-    }
-
-    private static string BuildCanonicalHost(Uri uri)
-    {
-        return uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
-    }
-
-    private static byte[] BuildS3SigningKey(string secretAccessKey, string dateStamp)
-    {
-        var dateKey = HmacSha256(Encoding.UTF8.GetBytes($"AWS4{secretAccessKey}"), dateStamp);
-        var dateRegionKey = HmacSha256(dateKey, S3Region);
-        var dateRegionServiceKey = HmacSha256(dateRegionKey, S3Service);
-        return HmacSha256(dateRegionServiceKey, "aws4_request");
-    }
-
-    private static byte[] HmacSha256(byte[] key, string value)
-    {
-        return HMACSHA256.HashData(key, Encoding.UTF8.GetBytes(value));
-    }
-
-    private static string ComputeSha256Hex(byte[] value)
-    {
-        return ToHexString(SHA256.HashData(value));
-    }
-
-    private static string ToHexString(byte[] value)
-    {
-        return Convert.ToHexString(value).ToLowerInvariant();
-    }
-
-    private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
-    {
-        if (response.IsSuccessStatusCode)
-        {
-            return;
-        }
-
-        var body = response.Content is null
-            ? string.Empty
-            : await response.Content.ReadAsStringAsync(cancellationToken);
-        var message = $"云同步请求失败：HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
-        if (!string.IsNullOrWhiteSpace(body))
-        {
-            message += $"。{TrimErrorBody(body)}";
-        }
-
-        throw new InvalidOperationException(message);
-    }
-
-    private static string TrimErrorBody(string body)
-    {
-        body = body.Trim();
-        return body.Length <= 180 ? body : body[..180];
-    }
-
-    private static StatisticsDocument DeserializeDocument(string json)
-    {
-        var document = JsonSerializer.Deserialize<StatisticsDocument>(json, JsonOptions)
-            ?? throw new InvalidOperationException("云端统计文件为空或格式不正确。");
-
-        if (!string.Equals(
-                document.Info?.Format,
-                StatisticsDocumentFormats.RocoPilotStatistics,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException("云端文件不是 RocoPilot 统计数据。");
-        }
-
-        return document;
-    }
-
-    private static string SerializeDocument(StatisticsDocument sourceDocument)
-    {
-        var json = JsonSerializer.Serialize(sourceDocument, JsonOptions);
-        var document = JsonSerializer.Deserialize<StatisticsDocument>(json, JsonOptions) ?? new StatisticsDocument();
-        document.Info = new StatisticsDocumentInfo
-        {
-            Format = StatisticsDocumentFormats.RocoPilotStatistics,
-            Version = StatisticsDocumentFormats.CurrentVersion,
-            ExportApp = "RocoPilot",
-            ExportedAt = DateTimeOffset.Now
-        };
-
-        return JsonSerializer.Serialize(document, JsonOptions);
-    }
-
-    private void SavePassword(string userName, string password)
-    {
-        if (string.IsNullOrWhiteSpace(userName) || string.IsNullOrWhiteSpace(password))
-        {
-            return;
-        }
-
-        var vault = new PasswordVault();
-        foreach (var credential in FindCredentials(vault))
-        {
-            vault.Remove(credential);
-        }
-
-        vault.Add(new PasswordCredential(CredentialResource, userName.Trim(), password));
-    }
-
-    private static string? ReadPassword(string userName)
-    {
-        if (string.IsNullOrWhiteSpace(userName))
-        {
-            return null;
-        }
-
-        var vault = new PasswordVault();
-        var credentials = FindCredentials(vault);
-        var credential = credentials.FirstOrDefault(item =>
-            string.Equals(item.UserName, userName.Trim(), StringComparison.OrdinalIgnoreCase));
-        if (credential is null)
-        {
-            return null;
-        }
-
-        credential.RetrievePassword();
-        return credential.Password;
-    }
-
-    private static IReadOnlyList<PasswordCredential> FindCredentials(PasswordVault vault)
-    {
-        try
-        {
-            return vault.FindAllByResource(CredentialResource);
-        }
-        catch
-        {
-            return [];
-        }
-    }
-
-    private static HttpClient CreateHttpClient()
-    {
-        return new HttpClient
-        {
-            Timeout = TimeSpan.FromSeconds(30)
-        };
-    }
-
-    private void ApplyStatusFromSettings(StatisticsSyncSettings settings, string message)
-    {
-        var provider = ResolveProvider(settings.ProviderId);
-        _status = new StatisticsSyncStatus
-        {
-            IsConfigured = HasRequiredSettings(settings),
-            IsEnabled = settings.IsEnabled,
-            IsBusy = _status.IsBusy,
-            ProviderId = settings.ProviderId,
-            ProviderName = provider.Name,
-            Message = message,
-            RemoteLastModifiedAt = settings.LastRemoteModifiedAt,
-            LastUploadedAt = settings.LastUploadedAt,
-            LastDownloadedAt = settings.LastDownloadedAt,
-            LastRemoteCheckedAt = settings.LastRemoteCheckedAt,
-            RemoteEntityTag = settings.LastRemoteEntityTag
-        };
-        RaiseStatusChanged();
+        StatusChanged?.Invoke(this, new StatisticsSyncStatusChangedEventArgs(snapshot));
     }
 
     private void SetBusy(bool isBusy, string? message = null)
     {
-        _status.IsBusy = isBusy;
-        if (!string.IsNullOrWhiteSpace(message))
+        StatisticsSyncStatus snapshot;
+        lock (_statusGate)
         {
-            _status.Message = message;
+            _status.IsBusy = isBusy;
+            if (!string.IsNullOrWhiteSpace(message)) _status.Message = message;
+            snapshot = CloneStatus(_status);
         }
-
-        RaiseStatusChanged();
+        StatusChanged?.Invoke(this, new StatisticsSyncStatusChangedEventArgs(snapshot));
     }
 
     private void SetFailureStatus(string title, Exception exception)
     {
         _logger.LogWarning(exception, "{Title}", title);
-        _status.IsBusy = false;
-        _status.Message = $"{title}：{exception.Message}";
-        RaiseStatusChanged();
+        SetBusy(false, $"{title}：{exception.Message}");
     }
 
-    private void RaiseStatusChanged()
+    private CancellationTokenSource CreateOperationCancellation(CancellationToken cancellationToken)
     {
-        StatusChanged?.Invoke(this, new StatisticsSyncStatusChangedEventArgs(CloneStatus(_status)));
-    }
-
-    private static string BuildIdleMessage(StatisticsSyncSettings settings)
-    {
-        if (!settings.IsEnabled)
+        lock (_disposeGate)
         {
-            return "云同步未启用";
+            if (_stopping) throw new OperationCanceledException("云同步服务正在关闭。", cancellationToken);
+            return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdown.Token);
         }
+    }
 
-        if (!HasRequiredSettings(settings))
+    public ValueTask DisposeAsync()
+    {
+        lock (_disposeGate)
         {
-            return "云同步配置不完整";
+            _stopping = true;
+            _statisticsService.DocumentChanged -= StatisticsService_DocumentChanged;
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
         }
-
-        return "云同步已启用";
     }
 
-    private static bool HasRequiredSettings(StatisticsSyncSettings settings)
+    private async Task DisposeCoreAsync()
     {
-        if (IsS3Provider(settings))
+        try
         {
-            return !string.IsNullOrWhiteSpace(settings.Endpoint)
-                && !string.IsNullOrWhiteSpace(settings.BucketName)
-                && !string.IsNullOrWhiteSpace(settings.RemotePath)
-                && !string.IsNullOrWhiteSpace(settings.UserName);
+            try { await _shutdown.CancelAsync(); }
+            finally { await _autoUpload.DisposeAsync(); }
         }
-
-        return !string.IsNullOrWhiteSpace(settings.Endpoint)
-            && !string.IsNullOrWhiteSpace(settings.RemotePath)
-            && !string.IsNullOrWhiteSpace(settings.UserName);
-    }
-
-    private static bool AreSameRemoteTarget(
-        StatisticsSyncSettings left,
-        StatisticsSyncSettings right)
-    {
-        return string.Equals(left.ProviderId, right.ProviderId, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(left.ProviderKind, right.ProviderKind, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(left.Endpoint.Trim(), right.Endpoint.Trim(), StringComparison.OrdinalIgnoreCase)
-            && string.Equals(left.BucketName.Trim(), right.BucketName.Trim(), StringComparison.Ordinal)
-            && string.Equals(
-                NormalizeRemotePath(left.RemotePath),
-                NormalizeRemotePath(right.RemotePath),
-                StringComparison.Ordinal)
-            && string.Equals(left.UserName.Trim(), right.UserName.Trim(), StringComparison.Ordinal);
-    }
-
-    private static void CopySyncMetadata(
-        StatisticsSyncSettings source,
-        StatisticsSyncSettings target)
-    {
-        target.LastUploadedAt = source.LastUploadedAt;
-        target.LastDownloadedAt = source.LastDownloadedAt;
-        target.LastRemoteCheckedAt = source.LastRemoteCheckedAt;
-        target.LastRemoteModifiedAt = source.LastRemoteModifiedAt;
-        target.LastRemoteEntityTag = source.LastRemoteEntityTag;
-        target.LastSyncedRemoteModifiedAt = source.LastSyncedRemoteModifiedAt;
-        target.LastSyncedRemoteEntityTag = source.LastSyncedRemoteEntityTag;
-        target.LastSyncedAccountFingerprints = NormalizeAccountFingerprints(source.LastSyncedAccountFingerprints);
-    }
-
-    private static void ClearSyncMetadata(StatisticsSyncSettings settings)
-    {
-        settings.LastUploadedAt = null;
-        settings.LastDownloadedAt = null;
-        settings.LastRemoteCheckedAt = null;
-        settings.LastRemoteModifiedAt = null;
-        settings.LastRemoteEntityTag = null;
-        settings.LastSyncedRemoteModifiedAt = null;
-        settings.LastSyncedRemoteEntityTag = null;
-        settings.LastSyncedAccountFingerprints = null;
-    }
-
-    private static Dictionary<string, string>? NormalizeAccountFingerprints(
-        IReadOnlyDictionary<string, string>? fingerprints)
-    {
-        if (fingerprints is null)
+        finally
         {
-            return null;
-        }
-
-        var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (uid, fingerprint) in fingerprints)
-        {
-            if (!string.IsNullOrWhiteSpace(uid) && !string.IsNullOrWhiteSpace(fingerprint))
+            // 已接收的手动操作与配置读写也必须退出，关闭后不再留下写入任务。
+            await _operationGate.WaitAsync();
+            try
             {
-                normalized[uid.Trim()] = fingerprint.Trim().ToLowerInvariant();
+                await _settingsGate.WaitAsync();
+                _settingsGate.Release();
+            }
+            finally
+            {
+                _operationGate.Release();
+                _shutdown.Dispose();
             }
         }
-
-        return normalized;
-    }
-
-    private static StatisticsSyncSettings NormalizeSettings(StatisticsSyncSettings settings)
-    {
-        var provider = ResolveProvider(settings.ProviderId);
-        var isSameProvider = string.Equals(settings.ProviderId, provider.Id, StringComparison.OrdinalIgnoreCase);
-        var endpoint = isSameProvider && !string.IsNullOrWhiteSpace(settings.Endpoint)
-            ? settings.Endpoint.Trim()
-            : provider.DefaultEndpoint;
-        var remotePath = isSameProvider && !string.IsNullOrWhiteSpace(settings.RemotePath)
-            ? NormalizeRemotePath(settings.RemotePath)
-            : provider.DefaultRemotePath;
-        var bucketName = isSameProvider
-            ? settings.BucketName.Trim()
-            : string.Empty;
-        var userName = isSameProvider
-            ? settings.UserName.Trim()
-            : string.Empty;
-        var lastUploadedAt = isSameProvider ? settings.LastUploadedAt : null;
-        var lastDownloadedAt = isSameProvider ? settings.LastDownloadedAt : null;
-        var lastRemoteCheckedAt = isSameProvider ? settings.LastRemoteCheckedAt : null;
-        var lastRemoteModifiedAt = isSameProvider ? settings.LastRemoteModifiedAt : null;
-        var lastRemoteEntityTag = isSameProvider ? NormalizeEntityTag(settings.LastRemoteEntityTag) : null;
-        var lastSyncedRemoteModifiedAt = isSameProvider ? settings.LastSyncedRemoteModifiedAt : null;
-        var lastSyncedRemoteEntityTag = isSameProvider ? NormalizeEntityTag(settings.LastSyncedRemoteEntityTag) : null;
-        var lastSyncedAccountFingerprints = isSameProvider
-            ? NormalizeAccountFingerprints(settings.LastSyncedAccountFingerprints)
-            : null;
-        var isEnabled = isSameProvider && settings.IsEnabled;
-
-        remotePath = string.IsNullOrWhiteSpace(remotePath)
-            ? provider.DefaultRemotePath
-            : NormalizeRemotePath(remotePath);
-
-        return new StatisticsSyncSettings
-        {
-            IsEnabled = isEnabled,
-            ProviderId = provider.Id,
-            ProviderKind = provider.Kind,
-            Endpoint = endpoint,
-            RemotePath = remotePath,
-            BucketName = bucketName,
-            UserName = userName,
-            LastUploadedAt = lastUploadedAt,
-            LastDownloadedAt = lastDownloadedAt,
-            LastRemoteCheckedAt = lastRemoteCheckedAt,
-            LastRemoteModifiedAt = lastRemoteModifiedAt,
-            LastRemoteEntityTag = lastRemoteEntityTag,
-            LastSyncedRemoteModifiedAt = lastSyncedRemoteModifiedAt,
-            LastSyncedRemoteEntityTag = lastSyncedRemoteEntityTag,
-            LastSyncedAccountFingerprints = lastSyncedAccountFingerprints
-        };
-    }
-
-    private static StatisticsSyncSettings CreateDefaultSettings()
-    {
-        var provider = ProviderOptions[0];
-        return new StatisticsSyncSettings
-        {
-            IsEnabled = false,
-            ProviderId = provider.Id,
-            ProviderKind = provider.Kind,
-            Endpoint = provider.DefaultEndpoint,
-            RemotePath = provider.DefaultRemotePath,
-            BucketName = string.Empty
-        };
-    }
-
-    private static bool IsS3Provider(StatisticsSyncSettings settings)
-    {
-        return string.Equals(settings.ProviderKind, StatisticsSyncProviderKinds.S3, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static StatisticsSyncProviderOption ResolveProvider(string? providerId)
-    {
-        return ProviderOptions.FirstOrDefault(provider =>
-            string.Equals(provider.Id, providerId, StringComparison.OrdinalIgnoreCase)) ?? ProviderOptions[0];
-    }
-
-    private static string NormalizeRemotePath(string path)
-    {
-        path = path.Replace('\\', '/').Trim();
-        var endsWithSlash = path.EndsWith("/", StringComparison.Ordinal);
-        path = string.Join("/", path.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-        return endsWithSlash && path.Length > 0 ? $"{path}/" : path;
-    }
-
-    private static string[] SplitRemotePath(string path)
-    {
-        var normalizedPath = NormalizeRemotePath(path);
-        return normalizedPath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-    }
-
-    private static DateTimeOffset? ReadLastModified(HttpResponseMessage response)
-    {
-        return response.Content.Headers.LastModified
-            ?? response.Headers.Date;
-    }
-
-    private static string? ReadEntityTag(HttpResponseMessage response)
-    {
-        var tag = response.Headers.ETag?.Tag;
-        if (string.IsNullOrWhiteSpace(tag)
-            && response.Headers.TryGetValues("ETag", out var values))
-        {
-            tag = values.FirstOrDefault();
-        }
-
-        return NormalizeEntityTag(tag);
-    }
-
-    private static bool HasRemoteChangedSinceLastSync(
-        StatisticsSyncSettings settings,
-        StatisticsSyncRemoteInfo remoteInfo)
-    {
-        if (!remoteInfo.Exists)
-        {
-            return false;
-        }
-
-        var syncedEntityTag = NormalizeEntityTag(settings.LastSyncedRemoteEntityTag);
-        var remoteEntityTag = NormalizeEntityTag(remoteInfo.EntityTag);
-        if (!string.IsNullOrWhiteSpace(syncedEntityTag)
-            && !string.IsNullOrWhiteSpace(remoteEntityTag))
-        {
-            return !string.Equals(syncedEntityTag, remoteEntityTag, StringComparison.Ordinal);
-        }
-
-        var syncedModifiedAt = settings.LastSyncedRemoteModifiedAt ?? ResolveLegacySyncedRemoteModifiedAt(settings);
-        if (syncedModifiedAt is null || remoteInfo.LastModifiedAt is null)
-        {
-            return true;
-        }
-
-        return !AreSameRemoteTimestamp(syncedModifiedAt.Value, remoteInfo.LastModifiedAt.Value);
-    }
-
-    private static bool HasRecordedSyncVersion(StatisticsSyncSettings settings)
-    {
-        return !string.IsNullOrWhiteSpace(settings.LastSyncedRemoteEntityTag)
-            || settings.LastSyncedRemoteModifiedAt is not null
-            || settings.LastUploadedAt is not null
-            || settings.LastDownloadedAt is not null;
-    }
-
-    private static DateTimeOffset? ResolveLegacySyncedRemoteModifiedAt(StatisticsSyncSettings settings)
-    {
-        var lastSyncAt = Max(settings.LastUploadedAt, settings.LastDownloadedAt);
-        if (lastSyncAt is null || settings.LastRemoteModifiedAt is null)
-        {
-            return null;
-        }
-
-        return settings.LastRemoteCheckedAt is null
-            || settings.LastRemoteCheckedAt.Value.ToUniversalTime() <= lastSyncAt.Value.ToUniversalTime().AddSeconds(1)
-            ? settings.LastRemoteModifiedAt
-            : null;
-    }
-
-    private static DateTimeOffset? Max(DateTimeOffset? left, DateTimeOffset? right)
-    {
-        if (left is null)
-        {
-            return right;
-        }
-
-        if (right is null)
-        {
-            return left;
-        }
-
-        return left >= right ? left : right;
-    }
-
-    private static bool AreSameRemoteTimestamp(DateTimeOffset left, DateTimeOffset right)
-    {
-        return Math.Abs((left.ToUniversalTime() - right.ToUniversalTime()).TotalSeconds) <= 1;
-    }
-
-    private static string? NormalizeEntityTag(string? entityTag)
-    {
-        entityTag = entityTag?.Trim();
-        if (string.IsNullOrWhiteSpace(entityTag))
-        {
-            return null;
-        }
-
-        if (entityTag.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
-        {
-            entityTag = entityTag[2..].Trim();
-        }
-
-        return entityTag.Length >= 2
-            && entityTag.StartsWith('"')
-            && entityTag.EndsWith('"')
-                ? entityTag[1..^1]
-                : entityTag;
-    }
-
-    private static StatisticsSyncProviderOption CloneProvider(StatisticsSyncProviderOption provider)
-    {
-        return new StatisticsSyncProviderOption
-        {
-            Id = provider.Id,
-            Name = provider.Name,
-            Kind = provider.Kind,
-            DefaultEndpoint = provider.DefaultEndpoint,
-            DefaultRemotePath = provider.DefaultRemotePath
-        };
-    }
-
-    private static StatisticsSyncSettings CloneSettings(StatisticsSyncSettings settings)
-    {
-        return new StatisticsSyncSettings
-        {
-            IsEnabled = settings.IsEnabled,
-            ProviderId = settings.ProviderId,
-            ProviderKind = settings.ProviderKind,
-            Endpoint = settings.Endpoint,
-            RemotePath = settings.RemotePath,
-            BucketName = settings.BucketName,
-            UserName = settings.UserName,
-            LastUploadedAt = settings.LastUploadedAt,
-            LastDownloadedAt = settings.LastDownloadedAt,
-            LastRemoteCheckedAt = settings.LastRemoteCheckedAt,
-            LastRemoteModifiedAt = settings.LastRemoteModifiedAt,
-            LastRemoteEntityTag = settings.LastRemoteEntityTag,
-            LastSyncedRemoteModifiedAt = settings.LastSyncedRemoteModifiedAt,
-            LastSyncedRemoteEntityTag = settings.LastSyncedRemoteEntityTag,
-            LastSyncedAccountFingerprints = NormalizeAccountFingerprints(settings.LastSyncedAccountFingerprints)
-        };
-    }
-
-    private static StatisticsSyncStatus CloneStatus(StatisticsSyncStatus status)
-    {
-        return new StatisticsSyncStatus
-        {
-            IsConfigured = status.IsConfigured,
-            IsEnabled = status.IsEnabled,
-            IsBusy = status.IsBusy,
-            ProviderId = status.ProviderId,
-            ProviderName = status.ProviderName,
-            Message = status.Message,
-            RemoteLastModifiedAt = status.RemoteLastModifiedAt,
-            LastUploadedAt = status.LastUploadedAt,
-            LastDownloadedAt = status.LastDownloadedAt,
-            LastRemoteCheckedAt = status.LastRemoteCheckedAt,
-            RemoteEntityTag = status.RemoteEntityTag
-        };
     }
 }

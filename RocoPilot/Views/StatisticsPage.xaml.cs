@@ -78,7 +78,7 @@ public sealed partial class StatisticsPage : Page
         }
         else
         {
-            ViewModel.SelectedAccount = account;
+            ViewModel.SelectAccount(account);
         }
 
         AccountSelectorFlyout.Hide();
@@ -536,7 +536,7 @@ public sealed partial class StatisticsPage : Page
         }
 
         await ViewModel.AddShinyAsync(
-            ViewModel.DefaultShinyAddSeasonId,
+            ViewModel.Overview.DefaultShinyAddSeasonId,
             input.Name,
             input.Count,
             input.CapturedAt,
@@ -552,7 +552,7 @@ public sealed partial class StatisticsPage : Page
             return;
         }
 
-        var details = ViewModel.GetShinyCaptureDetails(item).ToList();
+        var details = ViewModel.Overview.GetShinyCaptureDetails(item).ToList();
         if (details.Count == 0)
         {
             return;
@@ -907,6 +907,29 @@ public sealed partial class StatisticsPage : Page
         return string.IsNullOrWhiteSpace(seasonId) || seasonId.EndsWith("赛季", StringComparison.Ordinal)
             ? seasonId
             : $"{seasonId}赛季";
+    }
+
+    private async void PendingEncountersButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button) return;
+        button.IsEnabled = false;
+        try
+        {
+            var input = await PendingEncounterDialog.ShowAsync(XamlRoot, ViewModel.Overview.PendingEncounters);
+            if (input is null) return;
+            if (input.Discard)
+                await ViewModel.DiscardPendingEncounterAsync(input.Item);
+            else
+                await ViewModel.ConfirmPendingEncounterAsync(input.Item, input.Name);
+        }
+        catch (Exception ex)
+        {
+            ViewModel.ShowOperationFailed("处理待确认奇遇失败", ex);
+        }
+        finally
+        {
+            button.IsEnabled = true;
+        }
     }
 
     private async void ConfirmPendingShinyButton_Click(object sender, RoutedEventArgs e)

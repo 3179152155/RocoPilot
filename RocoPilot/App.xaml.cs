@@ -23,8 +23,10 @@ using RocoPilot.Services.Capture.Backends;
 using RocoPilot.Services.Encounters;
 using RocoPilot.Services.ImageMatching;
 using RocoPilot.Services.Recognition;
+using RocoPilot.Services.RuntimeTasks;
 using RocoPilot.Services.Spirits;
 using RocoPilot.Services.Statistics;
+using RocoPilot.Services.Statistics.Sync;
 using RocoPilot.Services.TextRecognition;
 using RocoPilot.Services.TextRecognition.Backends;
 using RocoPilot.ViewModels;
@@ -99,11 +101,19 @@ public partial class App : Application
             services.AddSingleton<IInterceptionDriverService, InterceptionDriverService>();
             services.AddSingleton<CameraSweepService>();
             services.AddSingleton<RuntimeTaskService>();
-            services.AddSingleton<StatisticsUidRuntimeTaskService>();
-            services.AddSingleton<IRuntimeTaskService>(
-                provider => provider.GetRequiredService<StatisticsUidRuntimeTaskService>());
+            services.AddSingleton<RuntimeDebugLogger>();
+            services.AddSingleton<RuntimeFrameRecognizer>();
+            services.AddSingleton<BattleScreenRecognizer>();
+            services.AddSingleton<AutoBattleInputExecutor>();
+            services.AddSingleton<StatisticsUidCoordinatorService>();
+            services.AddSingleton<IRuntimeSessionControl>(provider => provider.GetRequiredService<RuntimeTaskService>());
+            services.AddSingleton<IRuntimeTaskService>(provider => new RuntimeCoordinator(
+                provider.GetRequiredService<RuntimeTaskService>(),
+                provider.GetRequiredService<IIndependentTaskService>(),
+                provider.GetRequiredService<StatisticsUidCoordinatorService>()));
             services.AddSingleton<IStatisticsUidCoordinatorService>(
-                provider => provider.GetRequiredService<StatisticsUidRuntimeTaskService>());
+                provider => provider.GetRequiredService<StatisticsUidCoordinatorService>());
+            services.AddSingleton<IIndependentTaskService, IndependentTaskService>();
             services.AddSingleton<IHotkeyService, HotkeyService>();
             services.AddSingleton<IRecognitionOverlayService, RecognitionOverlayService>();
             services.AddSingleton<InfoOverlayService>();
@@ -111,8 +121,12 @@ public partial class App : Application
             services.AddSingleton<IInfoOverlayNotificationService>(provider => provider.GetRequiredService<InfoOverlayService>());
             services.AddSingleton<IRecognitionRegionConfigService, RecognitionRegionConfigService>();
             services.AddSingleton<IEncounterSeasonConfigService, EncounterSeasonConfigService>();
+            services.AddSingleton<EncounterSeasonReminderService>();
             services.AddSingleton<ISpiritCatalogService, SpiritCatalogService>();
             services.AddSingleton<IStatisticsService, StatisticsService>();
+            services.AddSingleton<IStatisticsRemoteStore>(_ => new S3StatisticsRemoteStore(
+                new HttpClient { Timeout = TimeSpan.FromSeconds(30) }));
+            services.AddSingleton<IStatisticsSyncCredentialStore, WindowsStatisticsSyncCredentialStore>();
             services.AddSingleton<IStatisticsSyncService, StatisticsSyncService>();
             services.AddSingleton<IStatisticsUidDetectionService, StatisticsUidDetectionService>();
             services.AddSingleton<IUpdateService, UpdateService>();
@@ -139,6 +153,8 @@ public partial class App : Application
             services.AddTransient<MainPage>();
             services.AddSingleton<RealtimeViewModel>();
             services.AddTransient<RealtimePage>();
+            services.AddSingleton<TasksViewModel>();
+            services.AddTransient<TasksPage>();
             services.AddSingleton<StatisticsViewModel>();
             services.AddTransient<StatisticsPage>();
             services.AddSingleton<LogViewModel>();

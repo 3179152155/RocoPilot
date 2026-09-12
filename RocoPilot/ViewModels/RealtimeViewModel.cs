@@ -4,6 +4,7 @@ using RocoPilot.Configuration;
 using RocoPilot.Contracts.Services;
 using RocoPilot.Contracts.Services.Encounters;
 using RocoPilot.Contracts.Services.Spirits;
+using RocoPilot.Contracts.Services.Statistics;
 using RocoPilot.Models.Input;
 using RocoPilot.Models.Runtime;
 using RocoPilot.Models.Spirits;
@@ -18,6 +19,7 @@ public partial class RealtimeViewModel : ObservableRecipient
     private readonly IRuntimeTaskService _runtimeTaskService;
     private readonly IEncounterSeasonConfigService _encounterSeasonConfigService;
     private readonly ISpiritCatalogService _spiritCatalogService;
+    private readonly IStatisticsService _statisticsService;
     private readonly ILocalSettingsService _localSettingsService;
     private readonly DispatcherQueue? _dispatcherQueue;
 
@@ -32,9 +34,7 @@ public partial class RealtimeViewModel : ObservableRecipient
     private bool _isAutoBattleEnabled;
     private string _autoBattleRoundOrder = AutoBattleSettings.DefaultRoundOrder;
     private string _autoBattleTurnSequence = AutoBattleSettings.DefaultTurnSequence;
-    private string _autoBattleBossComboSequence = AutoBattleSettings.DefaultBossComboSequence;
     private List<AutoBattleReleaseStep> _autoBattleReleaseSequence = AutoBattleSettings.CreateDefaultReleaseSequence();
-    private List<AutoBattleReleaseStep> _autoBattleBossReleaseSequence = AutoBattleSettings.CreateDefaultReleaseSequence();
     private List<AutoBattleTurnSequencePreset> _autoBattleTurnSequencePresets = [];
     private AutoBattleEncounterRelievedActionOption? _selectedAutoBattleEncounterRelievedActionOption;
     private AutoBattleKeyboardInputMethodOption? _selectedAutoBattleKeyboardInputMethodOption;
@@ -179,7 +179,7 @@ public partial class RealtimeViewModel : ObservableRecipient
     }
 
     public string AutoBattleConfigurationSummary =>
-        "配置普通/首领战斗的释放顺序、首领连招，以及可复用的公共执行序列。";
+        "配置普通战斗的释放顺序，以及可复用的公共执行序列。";
 
     public string AutoBattleOtherConfigurationSummary =>
         "包含高级时序选项；如无明确需求，建议保持默认设置。";
@@ -230,11 +230,13 @@ public partial class RealtimeViewModel : ObservableRecipient
         IRuntimeTaskService runtimeTaskService,
         IEncounterSeasonConfigService encounterSeasonConfigService,
         ISpiritCatalogService spiritCatalogService,
-        ILocalSettingsService localSettingsService)
+        ILocalSettingsService localSettingsService,
+        IStatisticsService statisticsService)
     {
         _runtimeTaskService = runtimeTaskService;
         _encounterSeasonConfigService = encounterSeasonConfigService;
         _spiritCatalogService = spiritCatalogService;
+        _statisticsService = statisticsService;
         _localSettingsService = localSettingsService;
         SpiritCatalogSources = _spiritCatalogService.GetSources();
         _selectedSpiritCatalogSource = SpiritCatalogSources.FirstOrDefault();
@@ -282,6 +284,16 @@ public partial class RealtimeViewModel : ObservableRecipient
             var document = await _spiritCatalogService.SyncAsync(source.Id, progress);
             ApplySpiritCatalogSummary(document);
             SpiritCatalogSyncStatus = $"同步完成：{document.Count} 个图鉴编号 · {document.Source.Name}";
+            try
+            {
+                var count = await _statisticsService.RematchPendingEncountersAsync(
+                    document, _encounterSeasonConfigService.Load().SpiritNameMatchThreshold);
+                if (count > 0) SpiritCatalogSyncStatus += $" · 已补全 {count} 条奇遇的精灵名称";
+            }
+            catch (Exception ex)
+            {
+                SpiritCatalogSyncStatus += $" · 待确认奇遇处理失败，可重新同步后重试：{ex.Message}";
+            }
         }
         catch (Exception ex)
         {
@@ -420,10 +432,7 @@ public partial class RealtimeViewModel : ObservableRecipient
         _isAutoBattleEnabled = settings.IsEnabled;
         _autoBattleRoundOrder = settings.RoundOrder;
         _autoBattleTurnSequence = settings.TurnSequence;
-        _autoBattleBossComboSequence = BossBattleComboSequence.NormalizeOrDefault(
-            settings.BossComboSequence);
         _autoBattleReleaseSequence = (settings.ReleaseSequence ?? []).Select(step => step.Clone()).ToList();
-        _autoBattleBossReleaseSequence = (settings.BossReleaseSequence ?? []).Select(step => step.Clone()).ToList();
         _autoBattleTurnSequencePresets = (settings.TurnSequencePresets ?? []).Select(preset => preset.Clone()).ToList();
         _selectedAutoBattleEncounterRelievedActionOption =
             FindAutoBattleEncounterRelievedActionOption(settings.EncounterRelievedAction);
@@ -470,9 +479,7 @@ public partial class RealtimeViewModel : ObservableRecipient
             IsEnabled = IsAutoBattleEnabled,
             RoundOrder = AutoBattleRoundOrder,
             TurnSequence = AutoBattleTurnSequence,
-            BossComboSequence = _autoBattleBossComboSequence,
             ReleaseSequence = _autoBattleReleaseSequence.Select(step => step.Clone()).ToList(),
-            BossReleaseSequence = _autoBattleBossReleaseSequence.Select(step => step.Clone()).ToList(),
             TurnSequencePresets = _autoBattleTurnSequencePresets.Select(preset => preset.Clone()).ToList(),
             EncounterRelievedAction = SelectedAutoBattleEncounterRelievedAction,
             KeyboardInputMethod = SelectedAutoBattleKeyboardInputMethod,

@@ -1,14 +1,19 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 using Microsoft.Extensions.Logging;
 
 using RocoPilot.Configuration;
 using RocoPilot.Contracts.Services;
+using RocoPilot.Contracts.Services.Encounters;
+using RocoPilot.Contracts.Services.Spirits;
 using RocoPilot.Contracts.Services.Statistics;
 using RocoPilot.Helpers;
 using RocoPilot.Models.Encounters;
 using RocoPilot.Models.Statistics;
+using RocoPilot.Models.Spirits;
+using RocoPilot.Services.Spirits;
+using RocoPilot.Services.Encounters;
 
 namespace RocoPilot.Services.Statistics;
 
@@ -22,6 +27,8 @@ public sealed class StatisticsService : IStatisticsService
 
     private readonly ILocalSettingsService _localSettingsService;
     private readonly ILogger<StatisticsService> _logger;
+    private readonly IEncounterSeasonConfigService? _seasonConfigService;
+    private readonly ISpiritCatalogService? _spiritCatalogService;
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     private StatisticsDocument _document = StatisticsDocumentNormalizer.CreateDefault();
@@ -35,7 +42,7 @@ public sealed class StatisticsService : IStatisticsService
 
     public event EventHandler? SelectedAccountChanged;
 
-    public StatisticsDocument CurrentDocument => CloneDocument(_document);
+    public StatisticsDocument CurrentDocument => CloneDocument(Volatile.Read(ref _document));
 
     public string? SelectedAccountUid => Volatile.Read(ref _selectedAccountUid);
 
@@ -45,10 +52,14 @@ public sealed class StatisticsService : IStatisticsService
 
     public StatisticsService(
         ILocalSettingsService localSettingsService,
-        ILogger<StatisticsService> logger)
+        ILogger<StatisticsService> logger,
+        IEncounterSeasonConfigService? seasonConfigService = null,
+        ISpiritCatalogService? spiritCatalogService = null)
     {
         _localSettingsService = localSettingsService;
         _logger = logger;
+        _seasonConfigService = seasonConfigService;
+        _spiritCatalogService = spiritCatalogService;
     }
 
     public async Task<StatisticsDocument> LoadAsync()
@@ -70,100 +81,155 @@ public sealed class StatisticsService : IStatisticsService
         }
     }
 
-    public async Task<StatisticsDocument> ReplaceAsync(StatisticsDocument document)
+    public Task<StatisticsDocument> ReplaceAsync(StatisticsDocument document)
     {
-        var changedDocument = await UpdateAsync(() => StatisticsDocumentNormalizer.Normalize(document));
-        EnsureActiveAccountExists(changedDocument);
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        var replacement = CloneDocument(document);
+        return UpdateAsync(_ => replacement);
     }
 
-    public async Task<StatisticsDocument> AddAccountAsync(string uid)
+    public async Task<StatisticsDocumentMergeResult> MergeRemoteAsync(
+        StatisticsDocument remoteDocument,
+        IReadOnlyDictionary<string, string>? lastSyncedAccountFingerprints,
+        bool preferRemoteAccountsWithoutBaseline,
+        CancellationToken cancellationToken = default)
+    {
+        var remote = CloneDocument(remoteDocument);
+        var baseline = lastSyncedAccountFingerprints?.ToDictionary(pair => pair.Key, pair => pair.Value);
+        IReadOnlyList<string> conflicts = [];
+        var changedDocument = await UpdateAsync(local =>
+        {
+            var result = StatisticsDocumentMerger.Merge(local, remote, baseline, preferRemoteAccountsWithoutBaseline);
+            conflicts = result.ConflictingAccountUids;
+            return result.Document;
+        }, StatisticsDocumentChangeSource.CloudSync, cancellationToken);
+        return new StatisticsDocumentMergeResult(changedDocument, conflicts);
+    }
+
+    public Task<StatisticsDocument> AddAccountAsync(string uid)
     {
         uid = uid.Trim();
-        var changedDocument = await UpdateAsync(() =>
+        return UpdateAsync(document =>
         {
-            if (_document.Accounts.Any(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase)))
+            if (!document.Accounts.Any(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase)))
             {
-                return _document;
+                document.Accounts.Add(new AccountStatisticsData { Uid = uid });
             }
-
-            _document.Accounts.Add(new AccountStatisticsData { Uid = uid });
-            return StatisticsDocumentNormalizer.Normalize(_document);
+            return document;
         });
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
     }
 
-    public async Task<StatisticsDocument> DeleteAccountAsync(string uid)
+    public Task<StatisticsDocument> DeleteAccountAsync(string uid)
     {
-        var changedDocument = await UpdateAsync(() =>
+        return UpdateAsync(document =>
         {
-            var account = _document.Accounts.FirstOrDefault(account =>
-                string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase));
-            if (account is not null)
-            {
-                _document.Accounts.Remove(account);
-            }
-
-            if (string.Equals(_selectedAccountUid, uid, StringComparison.OrdinalIgnoreCase))
-            {
-                _selectedAccountUid = _document.Accounts.FirstOrDefault()?.Uid;
-            }
-
-            if (string.Equals(ActiveAccountUid, uid, StringComparison.OrdinalIgnoreCase))
-            {
-                RequireActiveAccountSelection();
-            }
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
+            document.Accounts.RemoveAll(account => string.Equals(account.Uid, uid, StringComparison.OrdinalIgnoreCase));
+            return document;
         });
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
     }
 
-    public async Task<StatisticsDocument> ClearAsync()
+    public Task<StatisticsDocument> ClearAsync()
     {
-        var changedDocument = await UpdateAsync(() =>
+        return UpdateAsync(document =>
         {
-            _document.Accounts.Clear();
-            _selectedAccountUid = null;
-            RequireActiveAccountSelection();
-            return StatisticsDocumentNormalizer.Normalize(_document);
+            document.Accounts.Clear();
+            return document;
         });
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
     }
 
-    public async Task<StatisticsDocument> RecordEncounterAsync(
+    public Task<StatisticsDocument> RecordEncounterAsync(
         EncounterSeasonDefinition season,
         string spiritName,
-        DateTimeOffset capturedAt)
+        DateTimeOffset capturedAt,
+        string? accountUid = null)
     {
         spiritName = spiritName.Trim();
         if (string.IsNullOrWhiteSpace(spiritName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveActiveAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
+        season = ResolveRecordingSeason(season, capturedAt);
+        if (season.Id == EncounterSeasonTimeline.PendingSeasonId)
+            return UpdateAccountAsync(account => StatisticsMutationRules.AddPendingEncounter(
+                account, season, Guid.NewGuid().ToString("N"), string.Empty, capturedAt, spiritName),
+                useActiveAccount: true, accountUid: accountUid);
 
-            StatisticsMutationRules.RecordEncounter(account, season, spiritName, capturedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.RecordEncounter(account, season, spiritName, capturedAt),
+            useActiveAccount: true, accountUid: accountUid);
     }
 
-    public async Task<StatisticsDocument> UpsertEncounterAsync(
+    public Task<StatisticsDocument> AddPendingEncounterAsync(
+        string accountUid, EncounterSeasonDefinition season, string id, string rawText, DateTimeOffset detectedAt,
+        string? spiritName = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accountUid);
+        ArgumentException.ThrowIfNullOrWhiteSpace(season.Id);
+        ArgumentException.ThrowIfNullOrWhiteSpace(id);
+        season = ResolveRecordingSeason(season, detectedAt);
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.AddPendingEncounter(account, season, id, rawText, detectedAt, spiritName),
+            useActiveAccount: true, accountUid: accountUid);
+    }
+
+    public async Task<PendingEncounterConfirmationResult> ConfirmPendingEncounterAsync(
+        string accountUid, string id, string spiritName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accountUid);
+        ArgumentException.ThrowIfNullOrWhiteSpace(spiritName);
+        var result = PendingEncounterConfirmationResult.NotFound;
+        await UpdateAccountAsync(account =>
+            result = StatisticsMutationRules.ConfirmPendingEncounter(account, id, spiritName.Trim()),
+            accountUid: accountUid);
+        return result;
+    }
+
+    public Task<StatisticsDocument> DiscardPendingEncounterAsync(string accountUid, string id)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accountUid);
+        return UpdateAccountAsync(account =>
+        {
+            var pending = account.PendingEncounters.FirstOrDefault(item => item.Id == id);
+            if (pending is { HandledAt: null }) pending.HandledAt = DateTimeOffset.Now;
+        }, accountUid: accountUid);
+    }
+
+    public async Task<int> RematchPendingEncountersAsync(SpiritCatalogDocument catalog, double minimumSimilarity)
+    {
+        var index = new SpiritCatalogIndex(catalog);
+        var matchedCount = 0;
+        await UpdateAsync(document =>
+        {
+            matchedCount = MatchPendingNames(document, index, minimumSimilarity, out _);
+            return document;
+        });
+        return matchedCount;
+    }
+
+    private static int MatchPendingNames(StatisticsDocument document, SpiritCatalogIndex index, double minimumSimilarity, out bool changed)
+    {
+        changed = false;
+        var matchedCount = 0;
+        foreach (var account in document.Accounts)
+        {
+            foreach (var pending in account.PendingEncounters.Where(item => item.HandledAt is null && string.IsNullOrWhiteSpace(item.Name)))
+            {
+                var matchedName = index.Match(pending.RawText, minimumSimilarity);
+                if (string.IsNullOrWhiteSpace(matchedName)) continue;
+                changed = true;
+                var result = StatisticsMutationRules.ConfirmPendingEncounter(account, pending.Id, index.ResolveEvolutionRecordName(matchedName));
+                if (result is PendingEncounterConfirmationResult.Counted or PendingEncounterConfirmationResult.AwaitingSeason)
+                    matchedCount++;
+            }
+        }
+        return matchedCount;
+    }
+
+    private EncounterSeasonDefinition ResolveRecordingSeason(EncounterSeasonDefinition fallback, DateTimeOffset occurredAt) =>
+        _seasonConfigService is null ? fallback
+            : EncounterSeasonTimeline.ResolveForRecording(_seasonConfigService.Load(), occurredAt, fallback);
+
+    public Task<StatisticsDocument> UpsertEncounterAsync(
         string seasonId,
         string spiritName,
         int count,
@@ -176,27 +242,14 @@ public sealed class StatisticsService : IStatisticsService
             || string.IsNullOrWhiteSpace(spiritName)
             || count <= 0)
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.UpsertEncounter(account, seasonId, spiritName, count, countedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.UpsertEncounter(account, seasonId, spiritName, count, countedAt));
     }
 
-    public async Task<StatisticsDocument> EditEncounterAsync(
+    public Task<StatisticsDocument> EditEncounterAsync(
         string seasonId,
         string originalName,
         string nextName,
@@ -212,53 +265,27 @@ public sealed class StatisticsService : IStatisticsService
             || string.IsNullOrWhiteSpace(nextName)
             || nextCount <= 0)
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.EditEncounter(account, seasonId, originalName, nextName, nextCount, editedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.EditEncounter(account, seasonId, originalName, nextName, nextCount, editedAt));
     }
 
-    public async Task<StatisticsDocument> DeleteEncounterAsync(string seasonId, string spiritName)
+    public Task<StatisticsDocument> DeleteEncounterAsync(string seasonId, string spiritName)
     {
         seasonId = seasonId.Trim();
         spiritName = spiritName.Trim();
         if (string.IsNullOrWhiteSpace(seasonId) || string.IsNullOrWhiteSpace(spiritName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.DeleteEncounter(account, seasonId, spiritName);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.DeleteEncounter(account, seasonId, spiritName));
     }
 
-    public async Task<StatisticsDocument> AddShinyCapturesAsync(
+    public Task<StatisticsDocument> AddShinyCapturesAsync(
         string seasonId,
         string spiritName,
         int count,
@@ -273,17 +300,10 @@ public sealed class StatisticsService : IStatisticsService
             || string.IsNullOrWhiteSpace(spiritName)
             || count <= 0)
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
+        return UpdateAccountAsync(account =>
             StatisticsMutationRules.AddShinyCaptures(
                 account,
                 seasonId,
@@ -291,42 +311,23 @@ public sealed class StatisticsService : IStatisticsService
                 count,
                 capturedAt,
                 resetEncounterCount,
-                encounterCountBeforeCapture);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+                encounterCountBeforeCapture));
     }
 
-    public async Task<StatisticsDocument> DeleteShinyCapturesAsync(string? seasonId, string spiritName)
+    public Task<StatisticsDocument> DeleteShinyCapturesAsync(string? seasonId, string spiritName)
     {
         seasonId = string.IsNullOrWhiteSpace(seasonId) ? null : seasonId.Trim();
         spiritName = spiritName.Trim();
         if (string.IsNullOrWhiteSpace(spiritName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.DeleteShinyCaptures(account, seasonId, spiritName);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.DeleteShinyCaptures(account, seasonId, spiritName));
     }
 
-    public async Task<StatisticsDocument> EditShinyCaptureAsync(
+    public Task<StatisticsDocument> EditShinyCaptureAsync(
         string captureId,
         string nextName,
         int encounterCountBeforeCapture,
@@ -337,57 +338,31 @@ public sealed class StatisticsService : IStatisticsService
         encounterCountBeforeCapture = Math.Max(0, encounterCountBeforeCapture);
         if (string.IsNullOrWhiteSpace(captureId) || string.IsNullOrWhiteSpace(nextName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
+        return UpdateAccountAsync(account =>
             StatisticsMutationRules.EditShinyCapture(
                 account,
                 captureId,
                 nextName,
                 encounterCountBeforeCapture,
-                capturedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+                capturedAt));
     }
 
-    public async Task<StatisticsDocument> DeleteShinyCaptureAsync(string captureId)
+    public Task<StatisticsDocument> DeleteShinyCaptureAsync(string captureId)
     {
         captureId = captureId.Trim();
         if (string.IsNullOrWhiteSpace(captureId))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.DeleteShinyCapture(account, captureId);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.DeleteShinyCapture(account, captureId));
     }
 
-    public async Task<StatisticsDocument> AddPendingShinyCaptureAsync(
+    public Task<StatisticsDocument> AddPendingShinyCaptureAsync(
         EncounterSeasonDefinition season,
         string spiritName,
         DateTimeOffset detectedAt)
@@ -395,27 +370,15 @@ public sealed class StatisticsService : IStatisticsService
         spiritName = spiritName.Trim();
         if (string.IsNullOrWhiteSpace(season.Id) || string.IsNullOrWhiteSpace(spiritName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveActiveAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.AddPendingShinyCapture(account, season, spiritName, detectedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        season = ResolveRecordingSeason(season, detectedAt);
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.AddPendingShinyCapture(account, season, spiritName, detectedAt), useActiveAccount: true);
     }
 
-    public async Task<StatisticsDocument> ConfirmPendingShinyCaptureAsync(
+    public Task<StatisticsDocument> ConfirmPendingShinyCaptureAsync(
         string pendingCaptureId,
         string spiritName,
         int encounterCount,
@@ -427,54 +390,28 @@ public sealed class StatisticsService : IStatisticsService
         if (string.IsNullOrWhiteSpace(pendingCaptureId)
             || string.IsNullOrWhiteSpace(spiritName))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
+        return UpdateAccountAsync(account =>
             StatisticsMutationRules.ConfirmPendingShinyCapture(
                 account,
                 pendingCaptureId,
                 spiritName,
                 encounterCount,
-                confirmedAt);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+                confirmedAt));
     }
 
-    public async Task<StatisticsDocument> DiscardPendingShinyCaptureAsync(string pendingCaptureId)
+    public Task<StatisticsDocument> DiscardPendingShinyCaptureAsync(string pendingCaptureId)
     {
         pendingCaptureId = pendingCaptureId.Trim();
         if (string.IsNullOrWhiteSpace(pendingCaptureId))
         {
-            return await LoadAsync();
+            return LoadAsync();
         }
 
-        var changedDocument = await UpdateAsync(() =>
-        {
-            var account = ResolveTargetAccount(_document);
-            if (account is null)
-            {
-                return _document;
-            }
-
-            StatisticsMutationRules.DiscardPendingShinyCapture(account, pendingCaptureId);
-
-            return StatisticsDocumentNormalizer.Normalize(_document);
-        });
-
-        RaiseDocumentChanged(changedDocument);
-        return changedDocument;
+        return UpdateAccountAsync(account =>
+            StatisticsMutationRules.DiscardPendingShinyCapture(account, pendingCaptureId));
     }
 
     public void SetSelectedAccountUid(string? uid)
@@ -522,7 +459,7 @@ public sealed class StatisticsService : IStatisticsService
             return [];
         }
 
-        var account = ResolveActiveAccountForRead(_document);
+        var account = ResolveActiveAccountForRead(Volatile.Read(ref _document));
         var season = account?.Seasons.FirstOrDefault(item =>
             string.Equals(item.Id, seasonId.Trim(), StringComparison.OrdinalIgnoreCase));
         if (season is null)
@@ -554,7 +491,7 @@ public sealed class StatisticsService : IStatisticsService
 
     public IReadOnlyList<PendingShinyCaptureRecord> GetSelectedAccountPendingShinyCaptures()
     {
-        var account = ResolveSelectedAccountForRead(_document);
+        var account = ResolveSelectedAccountForRead(Volatile.Read(ref _document));
         if (account is null)
         {
             return [];
@@ -576,24 +513,72 @@ public sealed class StatisticsService : IStatisticsService
             .ToList();
     }
 
-    private async Task<StatisticsDocument> UpdateAsync(Func<StatisticsDocument> update)
+    private Task<StatisticsDocument> UpdateAccountAsync(
+        Action<AccountStatisticsData> update,
+        bool useActiveAccount = false,
+        string? accountUid = null)
     {
-        await _gate.WaitAsync();
-        try
+        // 账号属于这次操作的上下文，不能等拿到写锁后再读取用户的新选择。
+        var selectionRequired = accountUid is null && useActiveAccount && IsActiveAccountSelectionRequired;
+        var targetUid = accountUid ?? (useActiveAccount ? ActiveAccountUid : null)
+            ?? SelectedAccountUid
+            ?? Volatile.Read(ref _document).Accounts.FirstOrDefault()?.Uid;
+        return UpdateAsync(document =>
         {
-            if (!_isLoaded)
+            if (selectionRequired)
             {
-                await LoadCoreAsync();
+                LogMissingActiveAccountOnce("尚未确认本次启动使用的统计账号，本次自动统计已跳过。");
+                return document;
             }
 
-            _document = update();
-            await PersistAsync();
-            return CloneDocument(_document);
+            // 首次载入前尚无默认账号时，才从载入的数据中选第一个账号。
+            var account = targetUid is null ? document.Accounts.FirstOrDefault() : document.Accounts.FirstOrDefault(item =>
+                string.Equals(item.Uid, targetUid, StringComparison.OrdinalIgnoreCase));
+            if (account is null && !useActiveAccount)
+                throw new InvalidOperationException("操作对应的统计账号已不存在，请重新选择账号后重试。");
+            if (account is null)
+            {
+                if (string.Equals(ActiveAccountUid, targetUid, StringComparison.OrdinalIgnoreCase))
+                    RequireActiveAccountSelection();
+                LogMissingActiveAccountOnce($"统计账号 {targetUid} 已不存在，本次自动统计已跳过。");
+            }
+            if (account is not null) update(account);
+            return document;
+        });
+    }
+
+    private async Task<StatisticsDocument> UpdateAsync(
+        Func<StatisticsDocument, StatisticsDocument> update,
+        StatisticsDocumentChangeSource source = StatisticsDocumentChangeSource.Local,
+        CancellationToken cancellationToken = default)
+    {
+        StatisticsDocument changedDocument;
+        bool selectionChanged;
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!_isLoaded) await LoadCoreAsync();
+
+            // 已发布的文档只读。所有修改在副本上完成，持久化成功后再发布新快照。
+            var workingDocument = CloneDocument(_document);
+            if (_seasonConfigService is not null) StatisticsSeasonMigration.Apply(workingDocument, _seasonConfigService.Load());
+            var nextDocument = StatisticsDocumentNormalizer.Normalize(update(workingDocument));
+            if (_seasonConfigService is not null && StatisticsSeasonMigration.Apply(nextDocument, _seasonConfigService.Load()))
+                nextDocument = StatisticsDocumentNormalizer.Normalize(nextDocument);
+            cancellationToken.ThrowIfCancellationRequested();
+            await _localSettingsService.SaveSettingAsync(SettingsKeys.StatisticsData, nextDocument);
+            Volatile.Write(ref _document, nextDocument);
+            selectionChanged = ReconcileAccountSelection(nextDocument);
+            changedDocument = CloneDocument(nextDocument);
         }
         finally
         {
             _gate.Release();
         }
+
+        DocumentChanged?.Invoke(this, new StatisticsDocumentChangedEventArgs(changedDocument, source));
+        if (selectionChanged) SelectedAccountChanged?.Invoke(this, EventArgs.Empty);
+        return changedDocument;
     }
 
     private async Task LoadCoreAsync()
@@ -601,76 +586,57 @@ public sealed class StatisticsService : IStatisticsService
         try
         {
             var savedDocument = await _localSettingsService.ReadSettingAsync<StatisticsDocument>(SettingsKeys.StatisticsData);
-            _document = savedDocument is null
+            var document = savedDocument is null
                 ? StatisticsDocumentNormalizer.CreateDefault()
-                : StatisticsDocumentNormalizer.Normalize(savedDocument);
+                : StatisticsDocumentNormalizer.Normalize(CloneDocument(savedDocument));
+            var changed = false;
+            if (_seasonConfigService is not null)
+            {
+                var config = _seasonConfigService.Load();
+                changed = StatisticsSeasonMigration.Apply(document, config);
+                if (_spiritCatalogService is not null && document.Accounts.Any(account =>
+                    account.PendingEncounters.Any(item => item.HandledAt is null && string.IsNullOrWhiteSpace(item.Name))))
+                {
+                    try
+                    {
+                        // 只读取本地图鉴；软件自带图鉴更新后也能补名称，不在启动时联网同步。
+                        var catalog = await _spiritCatalogService.LoadAsync();
+                        MatchPendingNames(document, new SpiritCatalogIndex(catalog), config.SpiritNameMatchThreshold, out var namesChanged);
+                        changed |= namesChanged;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "暂存奇遇的本地图鉴匹配失败，保留原始记录等待后续同步。");
+                    }
+                }
+            }
+            if (changed)
+            {
+                document = StatisticsDocumentNormalizer.Normalize(document);
+                await _localSettingsService.SaveSettingAsync(SettingsKeys.StatisticsData, document);
+            }
+            Volatile.Write(ref _document, document);
+            _isLoaded = true;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "读取统计数据失败，已使用空统计数据。");
-            _document = StatisticsDocumentNormalizer.CreateDefault();
+            _logger.LogWarning(ex, "读取统计数据失败，保留当前状态并等待重试。");
+            throw;
         }
-
-        _isLoaded = true;
     }
 
-    private async Task PersistAsync()
+    private bool ReconcileAccountSelection(StatisticsDocument document)
     {
-        await _localSettingsService.SaveSettingAsync(SettingsKeys.StatisticsData, _document);
-    }
+        EnsureActiveAccountExists(document);
+        if (document.Accounts.Count == 0) RequireActiveAccountSelection();
 
-    private void RaiseDocumentChanged(StatisticsDocument document)
-    {
-        DocumentChanged?.Invoke(this, new StatisticsDocumentChangedEventArgs(document));
-    }
+        var selectedUid = SelectedAccountUid;
+        if (selectedUid is null || document.Accounts.Any(account =>
+                string.Equals(account.Uid, selectedUid, StringComparison.OrdinalIgnoreCase))) return false;
 
-    private AccountStatisticsData? ResolveTargetAccount(StatisticsDocument document)
-    {
-        var account = !string.IsNullOrWhiteSpace(_selectedAccountUid)
-            ? document.Accounts.FirstOrDefault(account =>
-                string.Equals(account.Uid, _selectedAccountUid, StringComparison.OrdinalIgnoreCase))
-            : null;
-
-        if (account is not null)
-        {
-            return account;
-        }
-
-        account = document.Accounts.FirstOrDefault();
-        if (account is not null)
-        {
-            _selectedAccountUid = account.Uid;
-            return account;
-        }
-
-        _logger.LogWarning("没有可写入的统计账号，本次奇遇记录已跳过。");
-        return null;
-    }
-
-    private AccountStatisticsData? ResolveActiveAccount(StatisticsDocument document)
-    {
-        if (IsActiveAccountSelectionRequired)
-        {
-            LogMissingActiveAccountOnce("尚未确认本次启动使用的统计账号，本次自动统计已跳过。");
-            return null;
-        }
-
-        var activeAccountUid = ActiveAccountUid;
-        if (!string.IsNullOrWhiteSpace(activeAccountUid))
-        {
-            var activeAccount = document.Accounts.FirstOrDefault(account =>
-                string.Equals(account.Uid, activeAccountUid, StringComparison.OrdinalIgnoreCase));
-            if (activeAccount is not null)
-            {
-                return activeAccount;
-            }
-
-            RequireActiveAccountSelection();
-            LogMissingActiveAccountOnce($"本次启动的统计账号 {activeAccountUid} 已不存在，本次自动统计已跳过。");
-            return null;
-        }
-
-        return ResolveTargetAccount(document);
+        // 保存期间用户可能切换账号，只修复仍指向被删除账号的选择。
+        var nextUid = document.Accounts.FirstOrDefault()?.Uid;
+        return Interlocked.CompareExchange(ref _selectedAccountUid, nextUid, selectedUid) == selectedUid;
     }
 
     private AccountStatisticsData? ResolveActiveAccountForRead(StatisticsDocument document)
